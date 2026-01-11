@@ -161,6 +161,75 @@ Deno.serve(async (req) => {
       .single();
 
     if (insertError) {
+      // Check if this is a unique constraint violation on cache_key
+      const isDuplicate =
+        insertError.code === '23505' ||
+        (insertError.message && (
+          insertError.message.includes('duplicate key value') ||
+          insertError.message.includes('idx_analysis_jobs_cache_key')
+        ));
+
+      if (isDuplicate) {
+        console.log(`[${requestId}] Duplicate cache_key detected - fetching existing job`);
+
+        // Query for existing job
+        const { data: existingJob, error: queryError } = await supabase
+          .from("analysis_jobs")
+          .select("id, status, job_token, updated_at")
+          .eq("cache_key", cacheKey)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .single();
+
+        if (queryError || !existingJob) {
+          console.error(`[${requestId}] Failed to fetch existing job:`, queryError);
+          return new Response(
+            JSON.stringify({
+              error: "Failed to fetch existing job",
+              details: queryError?.message || "Job not found",
+              request_id: requestId,
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } }
+          );
+        }
+
+        // If job_token is missing, generate and update
+        let jobToken = existingJob.job_token;
+        if (!jobToken) {
+          console.log(`[${requestId}] Existing job missing job_token - generating one`);
+          jobToken = crypto.randomUUID();
+
+          const { error: updateError } = await supabase
+            .from("analysis_jobs")
+            .update({ job_token: jobToken })
+            .eq("id", existingJob.id);
+
+          if (updateError) {
+            console.error(`[${requestId}] Failed to update job_token:`, updateError);
+            // Continue anyway - better to return without token than fail
+          }
+        }
+
+        console.log(`[${requestId}] ✓ Returning existing job ${existingJob.id} (status: ${existingJob.status})`);
+        const elapsed = Date.now() - startTime;
+
+        return new Response(
+          JSON.stringify({
+            status: existingJob.status,
+            job_id: existingJob.id,
+            job_token: jobToken,
+          }),
+          {
+            status: 202,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Response-Time-Ms": elapsed.toString(),
+            }
+          }
+        );
+      }
+
+      // Not a duplicate - genuine error
       console.error(`[${requestId}] Failed to enqueue:`, insertError);
       return new Response(
         JSON.stringify({
