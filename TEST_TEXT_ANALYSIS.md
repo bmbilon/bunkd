@@ -275,6 +275,38 @@ WITH CHECK (auth.uid() = user_id);
 
 ---
 
+### ❌ Error: "Invalid JWT"
+
+**Symptom:**
+- Function returns 401
+- Error body: `{ "code": 401, "message": "Invalid JWT" }`
+- Token prefix starts with `eyJhbGci...`
+
+**Cause:**
+- JWT was issued for a different Supabase project than the Edge Function URL
+- OR Authorization header is malformed
+
+**Solution:**
+- Check `[BunkdAPI] JWT claims (safe)` log
+- Ensure `ref` matches the project ref in the function URL
+- Ensure Edge Functions are called with BOTH:
+  - `apikey: <anon key>`
+  - `Authorization: Bearer <session.access_token>`
+- Ensure only ONE `createClient()` exists in the mobile app
+
+**SUCCESS CRITERIA:**
+- `ref` MUST equal: `qmhqfmkbvyeabftpchex`
+- Function base URL MUST match the same project ref
+
+If `ref` does NOT match, the JWT was issued by a different Supabase project and will ALWAYS be rejected.
+
+**Fix if Ref Mismatch Occurs:**
+- Ensure there is exactly ONE Supabase client in the mobile app
+- All API calls must import the same client
+- Do NOT hardcode Supabase URLs or keys in multiple files
+
+---
+
 ## Success Criteria
 
 TEXT analysis is working correctly when:

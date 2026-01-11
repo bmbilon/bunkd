@@ -1,5 +1,18 @@
 import { supabase, supabaseUrl, supabaseAnonKey } from './supabase';
 
+function decodeJwtPayloadSafe(token: string) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
+    const json = globalThis.atob(b64 + pad);
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
 export interface AnalyzeInput {
   url?: string;
   text?: string;
@@ -86,6 +99,16 @@ export class BunkdAPI {
       tokenLength: session.access_token.length,
       expiresAt: new Date(session.expires_at! * 1000).toISOString(),
     });
+
+    const claims = decodeJwtPayloadSafe(session.access_token);
+    console.log('[BunkdAPI] JWT claims (safe):', {
+      iss: claims?.iss,
+      aud: claims?.aud,
+      ref: claims?.ref,
+      sub: typeof claims?.sub === 'string' ? claims.sub.slice(0, 8) + '...' : undefined,
+    });
+    console.log('[BunkdAPI] Function base URL:', supabaseUrl);
+
     console.log(`[BunkdAPI] Method:`, method);
     console.log(`[BunkdAPI] Request body:`, body ? JSON.stringify(body, null, 2) : 'none');
 
