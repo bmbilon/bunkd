@@ -13,5 +13,6 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   },
 });
 
-// Export for use in fetch-based API calls
-export { supabaseUrl, supabaseAnonKey };
+// Export constants for API layer (prevents drift/hardcoding)
+export const SUPABASE_URL = supabaseUrl;
+export const SUPABASE_ANON_KEY = supabaseAnonKey;
