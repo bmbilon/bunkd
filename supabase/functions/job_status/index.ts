@@ -3,101 +3,98 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 
 Deno.serve(async (req) => {
   try {
-    // Get job_id from URL query params
+    // Parse query params
     const url = new URL(req.url);
     const jobId = url.searchParams.get("job_id");
+    const jobToken = url.searchParams.get("job_token");
 
-    if (!jobId) {
+    if (!jobId || !jobToken) {
       return new Response(
-        JSON.stringify({ error: "Missing job_id parameter" }),
+        JSON.stringify({
+          error: "Missing required parameters",
+          details: "Both job_id and job_token are required",
+        }),
         { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // Get auth header (optional now that verify_jwt is off)
-    const authHeader = req.headers.get("Authorization");
+    console.log(`[job_status] Checking job ${jobId.substring(0, 8)}...`);
 
-    // Create Supabase client
+    // Create Supabase client with service role (no JWT required)
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-      global: authHeader ? {
-        headers: { Authorization: authHeader },
-      } : undefined,
-    });
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // Try to get current user if auth header exists (for potential RLS filtering)
-    let userId: string | null = null;
-    if (authHeader) {
-      const {
-        data: { user },
-        error: userError,
-      } = await supabase.auth.getUser();
-
-      if (!userError && user) {
-        userId = user.id;
-        console.log(`Authenticated user: ${userId}`);
-      } else {
-        console.warn(`Auth header present but getUser failed:`, userError?.message);
-        // Continue without userId - RLS may restrict results
-      }
-    }
-
-    // Fetch job details
+    // Fetch job by ID
     const { data: job, error: jobError } = await supabase
       .from("analysis_jobs")
-      .select("id, status, error_message, created_at, completed_at")
+      .select("*")
       .eq("id", jobId)
       .single();
 
     if (jobError || !job) {
+      console.error(`[job_status] Job not found:`, jobError);
       return new Response(
-        JSON.stringify({ error: "Job not found" }),
+        JSON.stringify({
+          error: "Job not found",
+        }),
         { status: 404, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    const response: any = {
-      job_id: job.id,
-      status: job.status,
-      created_at: job.created_at,
-    };
-
-    // If job is completed, fetch the result
-    if (job.status === "completed") {
-      const { data: result, error: resultError } = await supabase
-        .from("analysis_results")
-        .select("result_data, created_at")
-        .eq("job_id", jobId)
-        .single();
-
-      if (resultError || !result) {
-        // Job is marked complete but no result found
-        response.error = "Result not found";
-      } else {
-        response.result = result.result_data;
-        response.result_created_at = result.created_at;
-      }
-
-      response.completed_at = job.completed_at;
+    // Verify job_token matches
+    if (job.job_token !== jobToken) {
+      console.warn(`[job_status] Token mismatch for job ${jobId}`);
+      return new Response(
+        JSON.stringify({
+          error: "Invalid job_token",
+        }),
+        { status: 403, headers: { "Content-Type": "application/json" } }
+      );
     }
 
-    // If job failed, include error message
-    if (job.status === "failed") {
-      response.error_message = job.error_message;
-      response.completed_at = job.completed_at;
+    console.log(`[job_status] Job ${jobId.substring(0, 8)}... status: ${job.status}`);
+
+    // Build response
+    const response: any = {
+      status: job.status,
+      job_id: job.id,
+      updated_at: job.updated_at,
+    };
+
+    // Include results if done
+    if (job.status === 'done' && job.result_json) {
+      response.bs_score = job.bs_score;
+      response.result_json = job.result_json;
+    }
+
+    // Include error if failed
+    if (job.status === 'failed') {
+      response.last_error_code = job.last_error_code;
+      response.last_error_message = job.last_error_message;
+    }
+
+    // Include metadata
+    if (job.attempts) {
+      response.attempts = job.attempts;
+    }
+    if (job.model_used) {
+      response.model_used = job.model_used;
+    }
+    if (job.perplexity_latency_ms) {
+      response.perplexity_latency_ms = job.perplexity_latency_ms;
     }
 
     return new Response(
       JSON.stringify(response),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
-  } catch (error) {
-    console.error("Error in job_status:", error);
 
+  } catch (error) {
+    console.error("[job_status] ERROR:", error);
     return new Response(
       JSON.stringify({
-        error: error.message || "Internal server error",
+        error: "Internal server error",
       }),
       { status: 500, headers: { "Content-Type": "application/json" } }
     );

@@ -131,12 +131,13 @@ export default function AnalyzeScreen() {
       const response = await BunkdAPI.analyzeProduct(input);
 
       // If cached result, navigate immediately
-      if (response.cached && response.result) {
+      if (response.status === 'cached' && response.result_json) {
         setIsAnalyzing(false);
         router.push({
           pathname: '/result',
           params: {
-            result: JSON.stringify(response.result),
+            result: JSON.stringify(response.result_json),
+            bsScore: response.bs_score?.toString() || '0',
             cached: 'true',
           },
         });
@@ -144,13 +145,14 @@ export default function AnalyzeScreen() {
       }
 
       // Otherwise, poll for completion
-      if (response.job_id) {
+      if (response.job_id && response.job_token) {
         setStatusMessage('Analyzing product...');
 
         const result = await BunkdAPI.pollJobStatus(
           response.job_id,
+          response.job_token,
           (status) => {
-            if (status.status === 'processing') {
+            if (status.status === 'running') {
               setStatusMessage('Processing analysis...');
             } else if (status.status === 'queued') {
               setStatusMessage('Waiting in queue...');
@@ -160,18 +162,19 @@ export default function AnalyzeScreen() {
 
         setIsAnalyzing(false);
 
-        if (result.status === 'completed' && result.result) {
+        if (result.status === 'done' && result.result_json) {
           router.push({
             pathname: '/result',
             params: {
-              result: JSON.stringify(result.result),
+              result: JSON.stringify(result.result_json),
+              bsScore: result.bs_score?.toString() || '0',
               jobId: response.job_id,
             },
           });
         } else if (result.status === 'failed') {
           Alert.alert(
             'Analysis Failed',
-            result.error_message || 'An error occurred during analysis'
+            result.last_error_message || 'An error occurred during analysis'
           );
         }
       }

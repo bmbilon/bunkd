@@ -71,22 +71,25 @@ export interface AnalysisResult {
 }
 
 export interface AnalyzeResponse {
-  status: 'queued' | 'processing' | 'completed';
-  job_id?: string;
-  cached?: boolean;
-  result?: AnalysisResult;
-  created_at?: string;
+  status: 'cached' | 'queued' | 'running' | 'done' | 'failed';
+  job_id: string;
+  job_token: string;
+  bs_score?: number;
+  result_json?: any;
+  updated_at?: string;
 }
 
 export interface JobStatusResponse {
+  status: 'queued' | 'running' | 'done' | 'failed';
   job_id: string;
-  status: 'queued' | 'processing' | 'completed' | 'failed';
-  created_at: string;
-  result?: AnalysisResult;
-  result_created_at?: string;
-  completed_at?: string;
-  error_message?: string;
-  error?: string;
+  bs_score?: number;
+  result_json?: any;
+  updated_at?: string;
+  last_error_code?: string;
+  last_error_message?: string;
+  attempts?: number;
+  model_used?: string;
+  perplexity_latency_ms?: number;
 }
 
 export class BunkdAPI {
@@ -323,15 +326,16 @@ export class BunkdAPI {
     });
   }
 
-  static async getJobStatus(jobId: string): Promise<JobStatusResponse> {
+  static async getJobStatus(jobId: string, jobToken: string): Promise<JobStatusResponse> {
     return this.callEdgeFunction<JobStatusResponse>('job_status', {
       method: 'GET',
-      query: { job_id: jobId },
+      query: { job_id: jobId, job_token: jobToken },
     });
   }
 
   static async pollJobStatus(
     jobId: string,
+    jobToken: string,
     onUpdate: (status: JobStatusResponse) => void,
     maxAttempts: number = 30,
     intervalMs: number = 2000
@@ -341,10 +345,10 @@ export class BunkdAPI {
 
       const poll = async () => {
         try {
-          const status = await this.getJobStatus(jobId);
+          const status = await this.getJobStatus(jobId, jobToken);
           onUpdate(status);
 
-          if (status.status === 'completed' || status.status === 'failed') {
+          if (status.status === 'done' || status.status === 'failed') {
             resolve(status);
             return;
           }

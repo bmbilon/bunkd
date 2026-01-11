@@ -1,267 +1,200 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
-import { AnalyzeInputSchema, createFingerprint } from "../_shared/validate.ts";
-import { getActiveRubric } from "../_shared/rubric.ts";
 
 // Generate unique request ID for tracking
 function generateRequestId(): string {
   return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
+// Normalize input for consistent caching
+function normalizeInput(type: string, value: string): string {
+  const trimmed = value.trim();
+
+  if (type === 'url') {
+    try {
+      const url = new URL(trimmed);
+      // Lowercase host, remove hash, normalize trailing slash
+      url.hostname = url.hostname.toLowerCase();
+      url.hash = '';
+      let normalized = url.toString();
+      // Remove trailing slash unless it's just the domain
+      if (normalized.endsWith('/') && url.pathname !== '/') {
+        normalized = normalized.slice(0, -1);
+      }
+      return normalized;
+    } catch {
+      return trimmed.toLowerCase();
+    }
+  }
+
+  return trimmed;
+}
+
+// Compute cache key
+async function computeCacheKey(inputType: string, normalizedInput: string): Promise<string> {
+  const text = `${inputType}:${normalizedInput}:v1`;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(text);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 Deno.serve(async (req) => {
   const requestId = generateRequestId();
   const startTime = Date.now();
 
-  console.log(`[${requestId}] ========== NEW REQUEST ==========`);
-  console.log(`[${requestId}] Method: ${req.method}`);
-  console.log(`[${requestId}] URL: ${req.url}`);
+  console.log(`[${requestId}] ========== ANALYZE_PRODUCT INGRESS ==========`);
 
   try {
-    // Parse and validate input
+    // Parse input
     let body: any;
     try {
       body = await req.json();
     } catch (parseError) {
-      console.error(`[${requestId}] Failed to parse JSON body:`, parseError);
       return new Response(
         JSON.stringify({
-          error: "Invalid JSON in request body",
-          details: parseError instanceof Error ? parseError.message : String(parseError),
-          where: "analyze_product",
+          error: "Invalid JSON",
           request_id: requestId,
         }),
         { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    console.log(`[${requestId}] Request body:`, JSON.stringify(body, null, 2));
+    // Extract input (support multiple naming conventions)
+    const url = body.url;
+    const text = body.text || body.content;
+    const imageUrl = body.image_url || body.imageUrl;
 
-    // Normalize input keys (support both naming conventions)
-    const normalizedBody = {
-      url: body.url,
-      text: body.text || body.content,
-      image_url: body.image_url || body.imageUrl,
-    };
+    // Determine input type and value
+    let inputType: string;
+    let inputValue: string;
 
-    // Determine input type for logging
-    let inputType = "unknown";
-    let contentLength = 0;
-    if (normalizedBody.url) {
-      inputType = "url";
-      contentLength = normalizedBody.url.length;
-    } else if (normalizedBody.text) {
-      inputType = "text";
-      contentLength = normalizedBody.text.length;
-    } else if (normalizedBody.image_url) {
-      inputType = "image";
-      contentLength = normalizedBody.image_url.length;
-    }
-
-    console.log(`[${requestId}] Input type: ${inputType}, content length: ${contentLength}`);
-
-    // Validate input
-    let input;
-    try {
-      input = AnalyzeInputSchema.parse(normalizedBody);
-      console.log(`[${requestId}] Input validation passed`);
-    } catch (validationError) {
-      console.error(`[${requestId}] Input validation failed:`, validationError);
+    if (url) {
+      inputType = 'url';
+      inputValue = url;
+    } else if (text) {
+      inputType = 'text';
+      inputValue = text;
+    } else if (imageUrl) {
+      inputType = 'image';
+      inputValue = imageUrl;
+    } else {
       return new Response(
         JSON.stringify({
           error: "Invalid input",
-          details: validationError instanceof Error ? validationError.message : String(validationError),
-          hint: "Provide at least one of: url, text, or image_url",
-          where: "analyze_product",
-          input_type: inputType,
+          details: "Provide one of: url, text, or image_url",
           request_id: requestId,
         }),
         { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // Get auth header (optional now that verify_jwt is off)
-    const authHeader = req.headers.get("Authorization");
-    const hasAuth = !!authHeader;
-    console.log(`[${requestId}] Auth present: ${hasAuth}`);
+    console.log(`[${requestId}] Input type: ${inputType}, length: ${inputValue.length}`);
 
-    // Create Supabase client
+    // Normalize input
+    const normalizedInput = normalizeInput(inputType, inputValue);
+
+    // Compute cache key
+    const cacheKey = await computeCacheKey(inputType, normalizedInput);
+    console.log(`[${requestId}] Cache key: ${cacheKey.substring(0, 16)}...`);
+
+    // Create Supabase client with service role (no JWT required)
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-      global: authHeader ? {
-        headers: { Authorization: authHeader },
-      } : undefined,
-    });
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // Try to get current user if auth header exists
-    let userId: string | null = null;
-    if (authHeader) {
-      const {
-        data: { user },
-        error: userError,
-      } = await supabase.auth.getUser();
-
-      if (!userError && user) {
-        userId = user.id;
-        console.log(`[${requestId}] User authenticated: ${userId}`);
-      } else {
-        console.warn(`[${requestId}] Auth header present but getUser failed:`, userError?.message);
-        // Continue with null userId - allow anonymous access
-      }
-    } else {
-      console.log(`[${requestId}] No auth header - proceeding with anonymous access`);
-    }
-
-    // Get active rubric
-    const rubric = await getActiveRubric();
-    console.log(`[${requestId}] Using rubric version: ${rubric.version}`);
-
-    // Create fingerprint for caching
-    const fingerprint = await createFingerprint(input, rubric.version);
-    console.log(`[${requestId}] Generated fingerprint: ${fingerprint.substring(0, 16)}...`);
-
-    // Check for cached result
-    const { data: cachedResult, error: cacheError } = await supabase
-      .from("analysis_results")
-      .select("id, result_data, created_at, expires_at")
-      .eq("fingerprint", fingerprint)
-      .gt("expires_at", new Date().toISOString())
-      .single();
-
-    if (cacheError && cacheError.code !== "PGRST116") {
-      // PGRST116 is "no rows returned", which is expected
-      console.warn(`[${requestId}] Cache lookup error:`, cacheError);
-    }
-
-    if (cachedResult) {
-      console.log(`[${requestId}] ✓ Cache hit! Returning cached result`);
-      const elapsed = Date.now() - startTime;
-      console.log(`[${requestId}] Request completed in ${elapsed}ms`);
-
-      return new Response(
-        JSON.stringify({
-          status: "completed",
-          cached: true,
-          result: cachedResult.result_data,
-          created_at: cachedResult.created_at,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    console.log(`[${requestId}] Cache miss - checking for existing job`);
-
-    // Check for existing queued or processing job
-    const { data: existingJob, error: jobLookupError } = await supabase
+    // Check cache for existing completed job
+    const { data: cachedJob, error: cacheError } = await supabase
       .from("analysis_jobs")
-      .select("id, status")
-      .eq("fingerprint", fingerprint)
-      .in("status", ["queued", "processing"])
-      .single();
+      .select("id, job_token, bs_score, result_json, updated_at")
+      .eq("cache_key", cacheKey)
+      .eq("status", "done")
+      .not("result_json", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    if (jobLookupError && jobLookupError.code !== "PGRST116") {
-      console.warn(`[${requestId}] Job lookup error:`, jobLookupError);
+    if (cacheError) {
+      console.error(`[${requestId}] Cache lookup error:`, cacheError);
+      // Continue to enqueue
     }
 
-    if (existingJob) {
-      console.log(`[${requestId}] ✓ Found existing job: ${existingJob.id} (${existingJob.status})`);
+    if (cachedJob && cachedJob.result_json) {
+      console.log(`[${requestId}] ✓ Cache hit - job ${cachedJob.id}`);
       const elapsed = Date.now() - startTime;
-      console.log(`[${requestId}] Request completed in ${elapsed}ms`);
 
       return new Response(
         JSON.stringify({
-          status: existingJob.status,
-          job_id: existingJob.id,
+          status: "cached",
+          job_id: cachedJob.id,
+          job_token: cachedJob.job_token,
+          bs_score: cachedJob.bs_score,
+          result_json: cachedJob.result_json,
+          updated_at: cachedJob.updated_at,
         }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "X-Response-Time-Ms": elapsed.toString(),
+          }
+        }
       );
     }
 
-    console.log(`[${requestId}] Creating new analysis job`);
+    console.log(`[${requestId}] Cache miss - enqueuing new job`);
 
-    // Create new job (userId may be null for anonymous/unauthenticated requests)
-    const { data: newJob, error: jobError } = await supabase
+    // Enqueue new job
+    const { data: newJob, error: insertError } = await supabase
       .from("analysis_jobs")
       .insert({
-        user_id: userId, // null is OK if schema allows it
-        fingerprint,
-        input_data: input,
-        rubric_version: rubric.version,
         status: "queued",
+        input_type: inputType,
+        input_value: inputValue,
+        normalized_input: normalizedInput,
+        cache_key: cacheKey,
+        attempts: 0,
+        request_id: requestId,
       })
-      .select("id")
+      .select("id, job_token")
       .single();
 
-    if (jobError) {
-      console.error(`[${requestId}] Failed to create job:`, jobError);
+    if (insertError) {
+      console.error(`[${requestId}] Failed to enqueue:`, insertError);
       return new Response(
         JSON.stringify({
-          error: "Failed to create analysis job",
-          details: jobError.message,
-          hint: jobError.hint || "Check database permissions and RLS policies",
-          where: "analyze_product",
-          input_type: inputType,
+          error: "Failed to create job",
+          details: insertError.message,
           request_id: requestId,
         }),
         { status: 500, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    console.log(`[${requestId}] ✓ Created job: ${newJob.id}`);
-
-    // Optionally log input to product_inputs table
-    let inputTypeForLog: "url" | "text" | "image" = "text";
-    let inputValue = "";
-
-    if (input.url) {
-      inputTypeForLog = "url";
-      inputValue = input.url;
-    } else if (input.image_url) {
-      inputTypeForLog = "image";
-      inputValue = input.image_url;
-    } else if (input.text) {
-      inputTypeForLog = "text";
-      inputValue = input.text;
-    }
-
-    const { error: inputLogError } = await supabase.from("product_inputs").insert({
-      user_id: userId, // null is OK if schema allows it
-      input_type: inputTypeForLog,
-      input_value: inputValue,
-      job_id: newJob.id,
-    });
-
-    if (inputLogError) {
-      console.warn(`[${requestId}] Failed to log input:`, inputLogError);
-      // Don't fail the request if input logging fails
-    } else {
-      console.log(`[${requestId}] ✓ Logged input to product_inputs`);
-    }
-
+    console.log(`[${requestId}] ✓ Enqueued job ${newJob.id}`);
     const elapsed = Date.now() - startTime;
-    console.log(`[${requestId}] Request completed in ${elapsed}ms`);
 
     return new Response(
       JSON.stringify({
         status: "queued",
         job_id: newJob.id,
+        job_token: newJob.job_token,
       }),
-      { status: 202, headers: { "Content-Type": "application/json" } }
+      {
+        status: 202,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Response-Time-Ms": elapsed.toString(),
+        }
+      }
     );
+
   } catch (error) {
-    console.error(`[${requestId}] ========== ERROR ==========`);
-    console.error(`[${requestId}] Error type:`, error?.constructor?.name);
-    console.error(`[${requestId}] Error message:`, error instanceof Error ? error.message : String(error));
-    console.error(`[${requestId}] Error stack:`, error instanceof Error ? error.stack : "N/A");
-
-    const elapsed = Date.now() - startTime;
-    console.log(`[${requestId}] Request failed after ${elapsed}ms`);
-
+    console.error(`[${requestId}] ERROR:`, error);
     return new Response(
       JSON.stringify({
-        error: error instanceof Error ? error.message : "Internal server error",
-        details: error instanceof Error ? error.stack : String(error),
-        where: "analyze_product",
+        error: "Internal server error",
         request_id: requestId,
       }),
       { status: 500, headers: { "Content-Type": "application/json" } }
