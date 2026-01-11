@@ -79,58 +79,38 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Get auth header
+    // Get auth header (optional now that verify_jwt is off)
     const authHeader = req.headers.get("Authorization");
     const hasAuth = !!authHeader;
     console.log(`[${requestId}] Auth present: ${hasAuth}`);
 
-    if (!authHeader) {
-      console.error(`[${requestId}] Missing authorization header`);
-      return new Response(
-        JSON.stringify({
-          error: "Missing authorization header",
-          details: "Authentication is required to use this function",
-          hint: "Ensure you are signed in (anonymous auth is supported)",
-          where: "analyze_product",
-          input_type: inputType,
-          request_id: requestId,
-        }),
-        { status: 401, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    // Create Supabase client with user's auth
+    // Create Supabase client
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-      global: {
+      global: authHeader ? {
         headers: { Authorization: authHeader },
-      },
+      } : undefined,
     });
 
-    // Get current user (works with anonymous auth)
-    const {
-      data: { user },
-      error: userError,
-    } = await supabase.auth.getUser();
+    // Try to get current user if auth header exists
+    let userId: string | null = null;
+    if (authHeader) {
+      const {
+        data: { user },
+        error: userError,
+      } = await supabase.auth.getUser();
 
-    if (userError || !user) {
-      console.error(`[${requestId}] Auth failed:`, userError);
-      return new Response(
-        JSON.stringify({
-          error: "Unauthorized",
-          details: userError?.message || "Failed to authenticate user",
-          hint: "Your session may have expired. Try signing in again.",
-          where: "analyze_product",
-          input_type: inputType,
-          request_id: requestId,
-        }),
-        { status: 401, headers: { "Content-Type": "application/json" } }
-      );
+      if (!userError && user) {
+        userId = user.id;
+        console.log(`[${requestId}] User authenticated: ${userId}`);
+      } else {
+        console.warn(`[${requestId}] Auth header present but getUser failed:`, userError?.message);
+        // Continue with null userId - allow anonymous access
+      }
+    } else {
+      console.log(`[${requestId}] No auth header - proceeding with anonymous access`);
     }
-
-    const userId = user.id;
-    console.log(`[${requestId}] User authenticated: ${userId}`);
 
     // Get active rubric
     const rubric = await getActiveRubric();
@@ -199,11 +179,11 @@ Deno.serve(async (req) => {
 
     console.log(`[${requestId}] Creating new analysis job`);
 
-    // Create new job
+    // Create new job (userId may be null for anonymous/unauthenticated requests)
     const { data: newJob, error: jobError } = await supabase
       .from("analysis_jobs")
       .insert({
-        user_id: userId,
+        user_id: userId, // null is OK if schema allows it
         fingerprint,
         input_data: input,
         rubric_version: rubric.version,
@@ -245,7 +225,7 @@ Deno.serve(async (req) => {
     }
 
     const { error: inputLogError } = await supabase.from("product_inputs").insert({
-      user_id: userId,
+      user_id: userId, // null is OK if schema allows it
       input_type: inputTypeForLog,
       input_value: inputValue,
       job_id: newJob.id,

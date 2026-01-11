@@ -205,11 +205,19 @@ export class BunkdAPI {
       const headers: Record<string, string> = {
         apikey: SUPABASE_ANON_KEY,
         Authorization: `Bearer ${session.access_token}`,
+        Accept: 'application/json',
       };
 
       if (method === 'POST' && body) {
         headers['Content-Type'] = 'application/json';
       }
+
+      console.log('[BunkdAPI] Headers present:', {
+        hasApikey: !!SUPABASE_ANON_KEY,
+        hasAuthorization: !!session.access_token,
+        hasContentType: !!headers['Content-Type'],
+        hasAccept: !!headers['Accept'],
+      });
 
       const fetchOptions: RequestInit = {
         method,

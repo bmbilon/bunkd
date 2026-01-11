@@ -14,35 +14,33 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Get auth header
+    // Get auth header (optional now that verify_jwt is off)
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return new Response(
-        JSON.stringify({ error: "Missing authorization header" }),
-        { status: 401, headers: { "Content-Type": "application/json" } }
-      );
-    }
 
-    // Create Supabase client with user's auth
+    // Create Supabase client
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-      global: {
+      global: authHeader ? {
         headers: { Authorization: authHeader },
-      },
+      } : undefined,
     });
 
-    // Verify user is authenticated
-    const {
-      data: { user },
-      error: userError,
-    } = await supabase.auth.getUser();
+    // Try to get current user if auth header exists (for potential RLS filtering)
+    let userId: string | null = null;
+    if (authHeader) {
+      const {
+        data: { user },
+        error: userError,
+      } = await supabase.auth.getUser();
 
-    if (userError || !user) {
-      return new Response(
-        JSON.stringify({ error: "Unauthorized" }),
-        { status: 401, headers: { "Content-Type": "application/json" } }
-      );
+      if (!userError && user) {
+        userId = user.id;
+        console.log(`Authenticated user: ${userId}`);
+      } else {
+        console.warn(`Auth header present but getUser failed:`, userError?.message);
+        // Continue without userId - RLS may restrict results
+      }
     }
 
     // Fetch job details

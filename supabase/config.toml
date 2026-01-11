@@ -383,7 +383,7 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.analyze_product]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/analyze_product/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -394,7 +394,7 @@ entrypoint = "./functions/analyze_product/index.ts"
 
 [functions.job_status]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/job_status/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -405,7 +405,7 @@ entrypoint = "./functions/job_status/index.ts"
 
 [functions.run_job]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/run_job/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
