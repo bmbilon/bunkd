@@ -6,6 +6,7 @@ import 'react-native-reanimated';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useAuth } from '@/hooks/use-auth';
+import { AuthWarningBanner } from '@/components/auth-warning-banner';
 
 export const unstable_settings = {
   anchor: '(tabs)',
@@ -13,10 +14,10 @@ export const unstable_settings = {
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
-  const { isInitialized } = useAuth();
+  const authState = useAuth();
 
   // Show loading screen while auth is initializing
-  if (!isInitialized) {
+  if (!authState.isInitialized) {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#007AFF" />
@@ -26,16 +27,30 @@ export default function RootLayout() {
 
   return (
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
-      </Stack>
+      <View style={styles.container}>
+        <AuthWarningBanner
+          isAnonymousDisabled={authState.isAnonymousDisabled}
+          error={authState.error}
+        />
+        <View style={styles.content}>
+          <Stack>
+            <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+            <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
+          </Stack>
+        </View>
+      </View>
       <StatusBar style="auto" />
     </ThemeProvider>
   );
 }
 
 const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  content: {
+    flex: 1,
+  },
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',

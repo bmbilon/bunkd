@@ -49,17 +49,34 @@ export class BunkdAPI {
     body?: any,
     params?: Record<string, string>
   ): Promise<T> {
-    console.log(`[BunkdAPI] Calling function: ${functionName}`, {
-      body,
-      hasAuth: !!supabase.auth.session,
+    // Verify session before making the call
+    const { data: { session } } = await supabase.auth.getSession();
+
+    console.log(`[BunkdAPI] ========== CALLING FUNCTION: ${functionName} ==========`);
+    console.log(`[BunkdAPI] Session status:`, {
+      hasSession: !!session,
+      userId: session?.user?.id || 'none',
+      hasAccessToken: !!session?.access_token,
+      tokenLength: session?.access_token?.length || 0,
+      expiresAt: session?.expires_at ? new Date(session.expires_at * 1000).toISOString() : 'none',
     });
+    console.log(`[BunkdAPI] Request body:`, JSON.stringify(body, null, 2));
+
+    if (!session) {
+      console.warn(`[BunkdAPI] ⚠️  No active session! Function call will likely fail.`);
+      console.warn(`[BunkdAPI]    Make sure anonymous sign-ins are enabled in Supabase Dashboard.`);
+    }
 
     const { data, error } = await supabase.functions.invoke(functionName, {
       body,
       ...(params && { method: 'GET' }),
     });
 
-    console.log(`[BunkdAPI] Response from ${functionName}:`, { data, error });
+    console.log(`[BunkdAPI] Response status:`, error ? 'ERROR' : 'SUCCESS');
+    console.log(`[BunkdAPI] Response data:`, data);
+    if (error) {
+      console.log(`[BunkdAPI] Response error:`, error);
+    }
 
     if (error) {
       // Extract detailed error information

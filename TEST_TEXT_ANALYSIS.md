@@ -2,38 +2,87 @@
 
 This guide will help you test and debug TEXT analysis in the Bunkd app after the improvements made to error handling and auth.
 
+## 🚨 CRITICAL FIRST STEP: Enable Anonymous Auth
+
+**The #1 reason TEXT analysis fails is because Anonymous Sign-ins are DISABLED in Supabase.**
+
+### Quick Fix (Do This First!)
+
+1. **Open Supabase Dashboard:**
+   https://supabase.com/dashboard/project/qmhqfmkbvyeabftpchex/auth/providers
+
+2. **Find "Anonymous sign-ins" and toggle it ON**
+
+3. **Click "Save"**
+
+4. **Run the verification script:**
+   ```bash
+   cd /Users/brettbilon/bunkd/apps/mobile
+   node verify-anon-auth.js
+   ```
+
+   Expected output:
+   ```
+   ✅ ANONYMOUS SIGN-IN SUCCESSFUL!
+
+   Session details:
+     User ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+     Access token length: 362
+     Token expires at: 2024-01-11T...
+     Provider: anonymous
+   ```
+
+   If you see an error, follow the instructions in the output.
+
+---
+
 ## Changes Made
 
-### 1. Client-Side Error Handling (`apps/mobile/lib/api.ts`)
+### 1. **Client-Side Error Handling** (`apps/mobile/lib/api.ts`)
 - Added detailed error parsing for `FunctionsHttpError`, `FunctionsRelayError`, and `FunctionsFetchError`
 - Errors now extract and display the full error body from Edge Functions
+- Added comprehensive session verification before every API call
 - Added console logging for debugging request/response flow
 
-### 2. Server-Side Error Handling (`supabase/functions/analyze_product/index.ts`)
+### 2. **Server-Side Error Handling** (`supabase/functions/analyze_product/index.ts`)
 - Added structured JSON error responses with `error`, `details`, `hint`, `where`, and `request_id` fields
 - Added comprehensive logging with unique request IDs for tracking
 - Added input normalization to support both `text`/`content` and `image_url`/`imageUrl` naming conventions
 - Added validation error messages with helpful hints
 - All errors now return proper JSON (no more generic 500s)
 
-### 3. Authentication (`apps/mobile/app/_layout.tsx` and `hooks/use-auth.ts`)
+### 3. **Hardened Authentication** (`apps/mobile/app/_layout.tsx` and `hooks/use-auth.ts`)
 - Added automatic anonymous authentication on app startup
+- **App will NOT crash if anonymous auth is disabled** - instead shows a warning banner
+- Added detailed console logging with clear error messages
 - Users are signed in silently before the app loads
 - Loading screen shown while auth initializes
 
-### 4. Supabase Configuration (`supabase/config.toml`)
-- Enabled anonymous sign-ins: `enable_anonymous_sign_ins = true`
+### 4. **Warning Banner** (`components/auth-warning-banner.tsx`)
+- Shows yellow warning banner when anonymous auth is disabled
+- Provides direct link to Supabase dashboard to enable it
+- Does NOT block the app from running
+
+### 5. **Verification Script** (`apps/mobile/verify-anon-auth.js`)
+- Quick test to verify anonymous auth is working
+- Shows clear error messages with fix instructions
+- Run before testing in the app
+
+---
 
 ## Testing Steps
 
-### Step 1: Enable Anonymous Auth in Remote Supabase
+### Step 1: Enable Anonymous Auth and Verify (REQUIRED)
 
-You need to enable anonymous auth in your remote Supabase project:
+```bash
+# 1. Enable anonymous auth in Supabase dashboard (see link above)
 
-1. Go to https://supabase.com/dashboard/project/qmhqfmkbvyeabftpchex/auth/providers
-2. Find "Anonymous Sign-In" in the providers list
-3. Enable it
-4. Save changes
+# 2. Run verification script
+cd /Users/brettbilon/bunkd/apps/mobile
+node verify-anon-auth.js
+```
+
+**Do not proceed until you see `✅ ANONYMOUS SIGN-IN SUCCESSFUL!`**
 
 ### Step 2: Deploy the Updated Edge Function
 
@@ -50,37 +99,7 @@ supabase functions deploy analyze_product
 supabase functions list
 ```
 
-### Step 3: Test the Function Directly with curl
-
-Test the function with a direct HTTP request to see detailed error messages:
-
-```bash
-# Replace with your actual Supabase URL and anon key from apps/mobile/lib/supabase.ts
-SUPABASE_URL="https://qmhqfmkbvyeabftpchex.supabase.co"
-ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFtaHFmbWtidnllYWJmdHBjaGV4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgxMzMyMzgsImV4cCI6MjA4MzcwOTIzOH0.LEmsl18C1cH3RjAQXC1TMViN7nrXbDgVEALHAYtY6PE"
-
-# Test without auth (should fail with helpful error)
-curl -i "${SUPABASE_URL}/functions/v1/analyze_product" \
-  -H "Content-Type: application/json" \
-  -H "apikey: ${ANON_KEY}" \
-  -d '{"text":"Turkesterone"}'
-
-# If you have a session token, test with auth
-# First, get a session token by signing in anonymously
-curl -X POST "${SUPABASE_URL}/auth/v1/signup" \
-  -H "Content-Type: application/json" \
-  -H "apikey: ${ANON_KEY}" \
-  -d '{}'
-
-# Copy the access_token from the response, then test again
-curl -i "${SUPABASE_URL}/functions/v1/analyze_product" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_ACCESS_TOKEN_HERE" \
-  -H "apikey: ${ANON_KEY}" \
-  -d '{"text":"Turkesterone"}'
-```
-
-### Step 4: Monitor Function Logs
+### Step 3: Monitor Function Logs
 
 In a separate terminal, watch the Edge Function logs in real-time:
 
@@ -90,14 +109,14 @@ supabase functions logs analyze_product --tail
 ```
 
 This will show you:
-- Request IDs
+- Request IDs with format `[req_timestamp_xxx]`
 - Input type and content length
-- Auth status
+- Auth status (user ID presence)
 - Cache hit/miss
 - Job creation status
 - Any errors with full stack traces
 
-### Step 5: Test in the Mobile App
+### Step 4: Test in the Mobile App
 
 1. Start the Expo dev server:
 ```bash
@@ -107,11 +126,33 @@ npm start
 
 2. Open the app in iOS Simulator or on device
 
-3. Check the console for auth initialization:
-```
-[Auth] Initializing authentication...
-[Auth] ✓ Signed in anonymously: <user_id>
-```
+3. **Check the console for auth initialization:**
+
+   **SUCCESS:**
+   ```
+   [Auth] ========== INITIALIZING AUTHENTICATION ==========
+   [Auth] No session found, attempting anonymous sign-in...
+   [Auth] ✓ Signed in anonymously successfully!
+   [Auth]   User ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+   [Auth]   Access token present: true
+   [Auth]   Token length: 362
+   [Auth]   Token expires at: 2024-01-11T...
+   ```
+
+   **FAILURE (Anonymous Auth Disabled):**
+   ```
+   [Auth] ⚠️  ANONYMOUS SIGN-INS ARE DISABLED
+   [Auth]    Error: Anonymous sign-ins are disabled
+   [Auth]    The app will run in unauthenticated mode.
+   [Auth]    Analysis requests will likely fail until you enable anonymous auth.
+   [Auth]
+   [Auth] TO FIX:
+   [Auth]   1. Go to Supabase Dashboard → Auth → Providers
+   [Auth]   2. Enable "Anonymous sign-ins"
+   [Auth]   3. Save and restart the app
+   ```
+
+   If you see the failure message, you'll also see a **yellow warning banner** at the top of the app with a button to open the Supabase dashboard.
 
 4. Navigate to the Analyze tab
 
@@ -119,33 +160,81 @@ npm start
 
 6. Tap "Analyze"
 
-7. Watch the console for detailed logging:
-```
-[BunkdAPI] Calling function: analyze_product
-[BunkdAPI] Response from analyze_product: ...
-```
+7. **Watch the console for API call logging:**
 
-### Step 6: Verify Error Visibility
+   ```
+   [BunkdAPI] ========== CALLING FUNCTION: analyze_product ==========
+   [BunkdAPI] Session status: {
+     hasSession: true,
+     userId: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+     hasAccessToken: true,
+     tokenLength: 362,
+     expiresAt: '2024-01-11T...'
+   }
+   [BunkdAPI] Request body: {
+     "text": "Turkesterone"
+   }
+   [BunkdAPI] Response status: SUCCESS
+   [BunkdAPI] Response data: { status: 'queued', job_id: '...' }
+   ```
+
+### Step 5: Verify Error Visibility
 
 If TEXT analysis fails, you should now see:
-- An Alert with the specific error message (not just "non-2xx status code")
+- An Alert with the specific error message (e.g., "Missing authorization header" instead of "non-2xx status code")
 - Detailed console logs showing:
+  - Session status (has auth token or not)
   - Request payload
   - Response status
-  - Error body
-  - Hints for fixing the issue
+  - Error body with `error`, `details`, and `hint` fields
+  - Request ID for tracking in function logs
+
+---
 
 ## Common Errors and Solutions
 
-### Error: "Missing authorization header"
-**Cause:** Anonymous auth failed or didn't complete before making the request
+### ⚠️ Error: "Anonymous sign-ins are disabled"
+
+**Symptom:**
+- App shows yellow warning banner
+- Console shows `[Auth] ⚠️  ANONYMOUS SIGN-INS ARE DISABLED`
+- API calls fail with "Missing authorization header"
+
+**Cause:** Anonymous auth is not enabled in Supabase dashboard
+
 **Solution:**
-- Check that anonymous sign-ins are enabled in Supabase dashboard
-- Check console for `[Auth]` logs showing successful initialization
+1. Go to https://supabase.com/dashboard/project/qmhqfmkbvyeabftpchex/auth/providers
+2. Toggle ON "Anonymous sign-ins"
+3. Save
+4. Run `node verify-anon-auth.js` to confirm
+5. Restart the app
+
+---
+
+### Error: "Missing authorization header"
+
+**Symptom:**
+- Function returns 401 status
+- Console shows `[BunkdAPI] ⚠️  No active session!`
+
+**Cause:** App couldn't sign in (anonymous auth disabled or network issue)
+
+**Solution:**
+- Check that anonymous sign-ins are enabled (see above)
+- Check console for `[Auth]` logs showing what went wrong
+- Run verification script: `node verify-anon-auth.js`
 - Restart the app to trigger fresh auth initialization
 
-### Error: "Failed to create analysis job" with RLS policy violation
+---
+
+### Error: "Failed to create analysis job"
+
+**Symptom:**
+- Function returns 500 status
+- Error message mentions RLS or permissions
+
 **Cause:** RLS policies on `analysis_jobs` table don't allow anonymous users to insert
+
 **Solution:** Update RLS policies to allow inserts for authenticated users (including anonymous):
 ```sql
 -- In Supabase SQL Editor
@@ -156,39 +245,70 @@ TO authenticated
 WITH CHECK (auth.uid() = user_id);
 ```
 
+---
+
 ### Error: "Invalid input"
+
+**Symptom:**
+- Function returns 400 status
+- Error message says "Invalid input"
+
 **Cause:** The payload doesn't match expected format
+
 **Solution:** Ensure you're sending at least one of: `url`, `text`, or `image_url`
 - The function now also accepts `content` (alias for `text`) and `imageUrl` (alias for `image_url`)
 
-### Error: Network timeout or connection refused
-**Cause:** Edge Function not deployed or Supabase URL incorrect
+---
+
+### Warning: "No active session"
+
+**Symptom:**
+- Console shows `[BunkdAPI] ⚠️  No active session! Function call will likely fail.`
+
+**Cause:** Auth initialization failed or session expired
+
 **Solution:**
-- Verify deployment: `supabase functions list`
-- Check Supabase URL in `apps/mobile/lib/supabase.ts` matches your project
+1. Check console for `[Auth]` error messages
+2. If anonymous auth is disabled, enable it
+3. If network error, check connection
+4. Restart app to re-initialize auth
+
+---
 
 ## Success Criteria
 
 TEXT analysis is working correctly when:
-1. ✅ App signs in anonymously on startup (check console)
-2. ✅ Submitting "Turkesterone" returns either:
+1. ✅ `node verify-anon-auth.js` shows successful sign-in
+2. ✅ App console shows `[Auth] ✓ Signed in anonymously successfully!`
+3. ✅ No yellow warning banner in the app
+4. ✅ Console shows `hasSession: true` before API calls
+5. ✅ Submitting "Turkesterone" returns either:
    - A cached result (status 200 with `cached: true`)
    - A new job ID (status 202 with `job_id`)
-3. ✅ If it fails, you see the actual error message in an Alert
-4. ✅ Function logs show detailed request/response info with request IDs
+6. ✅ If it fails, you see the actual error message in an Alert (not generic "non-2xx")
+7. ✅ Function logs show detailed request/response info with request IDs
+
+---
 
 ## Debugging Checklist
 
-If TEXT analysis still fails:
+If TEXT analysis still fails after enabling anonymous auth:
+
 - [ ] Anonymous auth is enabled in Supabase dashboard
+- [ ] `node verify-anon-auth.js` shows success
 - [ ] Edge Function is deployed: `supabase functions list`
-- [ ] App console shows `[Auth] ✓ Signed in anonymously`
-- [ ] Function logs show request with `[<request_id>]` format
+- [ ] App console shows `[Auth] ✓ Signed in anonymously successfully!`
+- [ ] App console shows `hasSession: true` before API calls
+- [ ] Function logs show request with `[req_timestamp_xxx]` format
 - [ ] Error message in app is specific (not generic "non-2xx")
 - [ ] Check RLS policies on `analysis_jobs` and `analysis_results` tables
+- [ ] Verify Supabase URL and anon key in `apps/mobile/lib/supabase.ts` match your project
+
+---
 
 ## Additional Resources
 
 - Supabase Anonymous Sign-In: https://supabase.com/docs/guides/auth/auth-anonymous
 - Supabase Edge Functions: https://supabase.com/docs/guides/functions
 - RLS Policies: https://supabase.com/docs/guides/auth/row-level-security
+- Supabase Dashboard: https://supabase.com/dashboard
