@@ -111,6 +111,39 @@ export class BunkdAPI {
     return session;
   }
 
+  private static async refreshOrReauthSession(reason: string) {
+    console.log(`[BunkdAPI] Refresh/Reauth triggered: ${reason}`);
+
+    // Try refreshSession first
+    const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession();
+
+    if (refreshError) {
+      console.log('[BunkdAPI] Refresh failed:', refreshError.message);
+    }
+
+    if (refreshed?.session?.access_token) {
+      console.log('[BunkdAPI] ✓ Refreshed session successfully');
+      return refreshed.session;
+    }
+
+    // If refresh failed or no token, force a full reauth
+    console.log('[BunkdAPI] Refresh did not return a valid token; forcing full reauth...');
+    await supabase.auth.signOut();
+
+    const { error: anonErr } = await supabase.auth.signInAnonymously();
+    if (anonErr) {
+      throw new Error(`Anonymous sign-in failed after signOut: ${anonErr.message}`);
+    }
+
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      throw new Error('No session after signOut+anonymous sign-in');
+    }
+
+    console.log('[BunkdAPI] ✓ Full reauth complete, new session obtained');
+    return session;
+  }
+
   private static async callEdgeFunction<T>(
     functionName: string,
     options: {
@@ -122,38 +155,10 @@ export class BunkdAPI {
     const { method = 'POST', body, query } = options;
 
     // Ensure we have a valid session
-    const session = await this.ensureSession();
+    let session = await this.ensureSession();
+    let hasRetried = false;
 
     console.log('[BunkdAPI] ========== CALLING EDGE FUNCTION:', functionName, '==========');
-
-    // Decode JWT header and payload
-    const { header, payload } = decodeJwtSafe(session.access_token);
-
-    console.log('[BunkdAPI] Session status:', {
-      userId: session.user?.id,
-      expiresAt: session.expires_at ? new Date(session.expires_at * 1000).toISOString() : null,
-      tokenLength: session.access_token?.length ?? 0,
-      tokenPrefix: (session.access_token?.slice(0, 12) ?? '') + '...',
-      alg: header?.alg,
-      kid: header?.kid,
-      iss: payload?.iss,
-      aud: payload?.aud,
-      role: payload?.role,
-      sub: typeof payload?.sub === 'string' ? payload.sub.slice(0, 8) + '...' : undefined,
-    });
-
-    // Verify token with auth endpoint before calling functions
-    const authVerify = await verifyTokenWithAuthEndpoint(session.access_token);
-    console.log('[BunkdAPI] Token verify (auth/v1/user):', authVerify);
-
-    if (!authVerify.ok) {
-      throw new Error(
-        `Auth token rejected by auth endpoint (${authVerify.status}). Session token is not valid.`
-      );
-    }
-
-    console.log('[BunkdAPI] Method:', method);
-    console.log('[BunkdAPI] Request body:', body ? JSON.stringify(body, null, 2) : 'none');
 
     // Build query string if provided
     const queryString = query ? '?' + new URLSearchParams(query).toString() : '';
@@ -167,84 +172,140 @@ export class BunkdAPI {
       ? `${functionsDomainBaseUrl}/${functionName}${queryString}`
       : null;
 
-    const headers: Record<string, string> = {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${session.access_token}`,
-    };
+    while (true) {
+      // Decode JWT header and payload
+      const { header, payload } = decodeJwtSafe(session.access_token);
 
-    if (method === 'POST' && body) {
-      headers['Content-Type'] = 'application/json';
-    }
+      console.log('[BunkdAPI] Session status:', {
+        userId: session.user?.id,
+        expiresAt: session.expires_at ? new Date(session.expires_at * 1000).toISOString() : null,
+        tokenLength: session.access_token?.length ?? 0,
+        tokenPrefix: (session.access_token?.slice(0, 12) ?? '') + '...',
+        alg: header?.alg,
+        kid: header?.kid,
+        iss: payload?.iss,
+        aud: payload?.aud,
+        role: payload?.role,
+        sub: typeof payload?.sub === 'string' ? payload.sub.slice(0, 8) + '...' : undefined,
+      });
 
-    const fetchOptions: RequestInit = {
-      method,
-      headers,
-    };
+      // Verify token with auth endpoint before calling functions
+      const authVerify = await verifyTokenWithAuthEndpoint(session.access_token);
+      console.log('[BunkdAPI] Token verify (auth/v1/user):', authVerify);
 
-    if (method === 'POST' && body) {
-      fetchOptions.body = JSON.stringify(body);
-    }
+      if (!authVerify.ok) {
+        throw new Error(
+          `Auth token rejected by auth endpoint (${authVerify.status}). Session token is not valid.`
+        );
+      }
 
-    // Try primary URL first
-    console.log('[BunkdAPI] Fetching URL (primary):', primaryUrl);
-    let response = await fetch(primaryUrl, fetchOptions);
-    let responseText = await response.text();
+      console.log('[BunkdAPI] Method:', method);
+      console.log('[BunkdAPI] Request body:', body ? JSON.stringify(body, null, 2) : 'none');
 
-    console.log('[BunkdAPI] Response status:', response.status, response.statusText);
-    console.log('[BunkdAPI] Response body (raw):', responseText.slice(0, 500));
+      const headers: Record<string, string> = {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${session.access_token}`,
+      };
 
-    let data: any;
-    try {
-      data = responseText ? JSON.parse(responseText) : null;
-    } catch (parseError) {
-      console.error('[BunkdAPI] Failed to parse response as JSON:', parseError);
-      data = responseText;
-    }
+      if (method === 'POST' && body) {
+        headers['Content-Type'] = 'application/json';
+      }
 
-    // If primary URL returns 401 with "Invalid JWT", try fallback
-    if (
-      response.status === 401 &&
-      fallbackUrl &&
-      (
-        (typeof data === 'object' && data?.message?.includes('Invalid JWT')) ||
-        (typeof data === 'string' && data.includes('Invalid JWT'))
-      )
-    ) {
-      console.log('[BunkdAPI] Primary functions URL returned Invalid JWT; retrying via functions domain...');
-      console.log('[BunkdAPI] Fetching URL (fallback):', fallbackUrl);
+      const fetchOptions: RequestInit = {
+        method,
+        headers,
+      };
 
-      response = await fetch(fallbackUrl, fetchOptions);
-      responseText = await response.text();
+      if (method === 'POST' && body) {
+        fetchOptions.body = JSON.stringify(body);
+      }
 
-      console.log('[BunkdAPI] Fallback response status:', response.status, response.statusText);
-      console.log('[BunkdAPI] Fallback response body (raw):', responseText.slice(0, 500));
+      // Try primary URL first
+      console.log('[BunkdAPI] Fetching URL (primary):', primaryUrl);
+      let response = await fetch(primaryUrl, fetchOptions);
+      let responseText = await response.text();
 
+      console.log('[BunkdAPI] Response status:', response.status, response.statusText);
+      console.log('[BunkdAPI] Response body (raw):', responseText.slice(0, 500));
+
+      let data: any;
       try {
         data = responseText ? JSON.parse(responseText) : null;
       } catch (parseError) {
-        console.error('[BunkdAPI] Failed to parse fallback response as JSON:', parseError);
+        console.error('[BunkdAPI] Failed to parse response as JSON:', parseError);
         data = responseText;
       }
+
+      // Check if this is an Invalid JWT error
+      const isInvalidJWT =
+        response.status === 401 &&
+        ((typeof data === 'object' && data?.message?.includes('Invalid JWT')) ||
+          (typeof data === 'string' && data.includes('Invalid JWT')));
+
+      // If Invalid JWT and we haven't retried yet, try refresh/reauth
+      if (isInvalidJWT && !hasRetried) {
+        console.log('[BunkdAPI] Functions returned Invalid JWT; attempting refresh/reauth...');
+        session = await this.refreshOrReauthSession('Functions returned Invalid JWT');
+        hasRetried = true;
+        continue; // Retry the entire request with new session
+      }
+
+      // If Invalid JWT and we have a fallback URL, try fallback
+      if (isInvalidJWT && fallbackUrl) {
+        console.log('[BunkdAPI] Retrying via alternate functions domain...');
+        console.log('[BunkdAPI] Fetching URL (fallback):', fallbackUrl);
+
+        response = await fetch(fallbackUrl, fetchOptions);
+        responseText = await response.text();
+
+        console.log('[BunkdAPI] Fallback response status:', response.status, response.statusText);
+        console.log('[BunkdAPI] Fallback response body (raw):', responseText.slice(0, 500));
+
+        try {
+          data = responseText ? JSON.parse(responseText) : null;
+        } catch (parseError) {
+          console.error('[BunkdAPI] Failed to parse fallback response as JSON:', parseError);
+          data = responseText;
+        }
+      }
+
+      // If still Invalid JWT after retry, throw detailed error
+      if (
+        response.status === 401 &&
+        ((typeof data === 'object' && data?.message?.includes('Invalid JWT')) ||
+          (typeof data === 'string' && data.includes('Invalid JWT')))
+      ) {
+        const errorDetails = [
+          `Final status: ${response.status}`,
+          `Response body: ${responseText.slice(0, 200)}`,
+          `JWT alg: ${header?.alg}`,
+          `JWT kid: ${header?.kid}`,
+          `URL attempted: ${fallbackUrl ? 'primary + fallback' : 'primary only'}`,
+        ].join('\n');
+
+        console.error('[BunkdAPI] Still Invalid JWT after retry:', errorDetails);
+        throw new Error(`Invalid JWT error persisted after retry.\n${errorDetails}`);
+      }
+
+      // Handle other errors
+      if (!response.ok) {
+        const errorMessage =
+          typeof data === 'object' && data
+            ? data.error || data.message || JSON.stringify(data)
+            : String(data || response.statusText);
+
+        const details =
+          typeof data === 'object' && data?.details ? `\n${data.details}` : '';
+        const hint =
+          typeof data === 'object' && data?.hint ? `\nHint: ${data.hint}` : '';
+
+        console.error('[BunkdAPI] API Error (' + response.status + '):', errorMessage + details + hint);
+        throw new Error(`API Error (${response.status}): ${errorMessage}${details}${hint}`);
+      }
+
+      console.log('[BunkdAPI] ✓ SUCCESS');
+      return data as T;
     }
-
-    // Handle errors
-    if (!response.ok) {
-      const errorMessage =
-        typeof data === 'object' && data
-          ? data.error || data.message || JSON.stringify(data)
-          : String(data || response.statusText);
-
-      const details =
-        typeof data === 'object' && data?.details ? `\n${data.details}` : '';
-      const hint =
-        typeof data === 'object' && data?.hint ? `\nHint: ${data.hint}` : '';
-
-      console.error('[BunkdAPI] API Error (' + response.status + '):', errorMessage + details + hint);
-      throw new Error(`API Error (${response.status}): ${errorMessage}${details}${hint}`);
-    }
-
-    console.log('[BunkdAPI] ✓ SUCCESS');
-    return data as T;
   }
 
   static async analyzeProduct(input: AnalyzeInput): Promise<AnalyzeResponse> {
