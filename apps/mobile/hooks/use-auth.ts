@@ -36,8 +36,9 @@ export function useAuth(): AuthState {
         if (session) {
           console.log('[Auth] ✓ User already authenticated');
           console.log('[Auth]   User ID:', session.user.id);
-          console.log('[Auth]   Access token present:', !!session.access_token);
-          console.log('[Auth]   Token length:', session.access_token?.length || 0);
+          console.log('[Auth]   Access token prefix:', session.access_token.slice(0, 12) + '...');
+          console.log('[Auth]   Token length:', session.access_token.length);
+          console.log('[Auth]   Token expires at:', new Date(session.expires_at! * 1000).toISOString());
 
           if (mounted) {
             setState({
@@ -93,8 +94,8 @@ export function useAuth(): AuthState {
         if (data.session && data.user) {
           console.log('[Auth] ✓ Signed in anonymously successfully!');
           console.log('[Auth]   User ID:', data.user.id);
-          console.log('[Auth]   Access token present:', !!data.session.access_token);
-          console.log('[Auth]   Token length:', data.session.access_token?.length || 0);
+          console.log('[Auth]   Access token prefix:', data.session.access_token.slice(0, 12) + '...');
+          console.log('[Auth]   Token length:', data.session.access_token.length);
           console.log('[Auth]   Token expires at:', new Date(data.session.expires_at! * 1000).toISOString());
 
           if (mounted) {

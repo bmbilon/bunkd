@@ -44,31 +44,51 @@ export interface JobStatusResponse {
 }
 
 export class BunkdAPI {
+  private static async ensureSession() {
+    const getSession = async () => (await supabase.auth.getSession()).data.session;
+
+    let session = await getSession();
+
+    if (!session) {
+      console.log(`[BunkdAPI] No session at invoke-time; signing in anonymously...`);
+      const { error } = await supabase.auth.signInAnonymously();
+      if (error) {
+        throw new Error(`Anonymous sign-in failed: ${error.message}`);
+      }
+      session = await getSession();
+      if (!session) {
+        throw new Error('No session after anonymous sign-in');
+      }
+      console.log(`[BunkdAPI] ✓ Signed in anonymously, got session`);
+    }
+
+    return session;
+  }
+
   private static async callFunction<T>(
     functionName: string,
     body?: any,
     params?: Record<string, string>
   ): Promise<T> {
-    // Verify session before making the call
-    const { data: { session } } = await supabase.auth.getSession();
+    // Ensure we have a valid session
+    const session = await this.ensureSession();
 
     console.log(`[BunkdAPI] ========== CALLING FUNCTION: ${functionName} ==========`);
     console.log(`[BunkdAPI] Session status:`, {
-      hasSession: !!session,
-      userId: session?.user?.id || 'none',
-      hasAccessToken: !!session?.access_token,
-      tokenLength: session?.access_token?.length || 0,
-      expiresAt: session?.expires_at ? new Date(session.expires_at * 1000).toISOString() : 'none',
+      hasSession: true,
+      userId: session.user.id,
+      hasAccessToken: true,
+      tokenPrefix: session.access_token.slice(0, 12) + '...',
+      tokenLength: session.access_token.length,
+      expiresAt: new Date(session.expires_at! * 1000).toISOString(),
     });
     console.log(`[BunkdAPI] Request body:`, JSON.stringify(body, null, 2));
 
-    if (!session) {
-      console.warn(`[BunkdAPI] ⚠️  No active session! Function call will likely fail.`);
-      console.warn(`[BunkdAPI]    Make sure anonymous sign-ins are enabled in Supabase Dashboard.`);
-    }
-
     const { data, error } = await supabase.functions.invoke(functionName, {
       body,
+      headers: {
+        Authorization: `Bearer ${session.access_token}`,
+      },
       ...(params && { method: 'GET' }),
     });
 
@@ -130,16 +150,8 @@ export class BunkdAPI {
   }
 
   static async getJobStatus(jobId: string): Promise<JobStatusResponse> {
-    const { data, error } = await supabase.functions.invoke(
-      `job_status?job_id=${jobId}`,
-      { method: 'GET' }
-    );
-
-    if (error) {
-      throw new Error(`API Error: ${error.message}`);
-    }
-
-    return data as JobStatusResponse;
+    // Use callFunction to ensure proper session handling
+    return this.callFunction<JobStatusResponse>(`job_status?job_id=${jobId}`, undefined, { _dummy: 'get' });
   }
 
   static async pollJobStatus(
