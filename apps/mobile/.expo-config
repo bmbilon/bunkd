@@ -1,0 +1,35 @@
+# Expo/EAS Configuration Summary
+# This file documents the canonical Expo configuration for the Bunkd mobile app
+# DO NOT MODIFY - This is for reference only
+
+PROJECT_OWNER=execom-inc
+PROJECT_SLUG=bunkd
+PROJECT_NAME=Bunkd
+PROJECT_ID=13cf0542-2cdd-4642-a2b1-6a85169441c0
+
+IOS_BUNDLE_ID=com.execominc.bunkd
+ANDROID_PACKAGE=com.execominc.bunkd
+
+EXPO_DASHBOARD=https://expo.dev/accounts/execom-inc/projects/bunkd
+
+# Verification Command
+# Run: npx eas project:info
+# Expected output:
+#   fullName  @execom-inc/bunkd
+#   ID        13cf0542-2cdd-4642-a2b1-6a85169441c0
+
+# Configuration Files
+# - app.json: Main Expo configuration
+# - eas.json: EAS build profiles
+# - package.json: NPM scripts for builds
+
+# Build Commands
+# npm run build:ios              # Production iOS build
+# npm run build:android          # Production Android build
+# npm run build:all              # Build both platforms
+# npm run build:preview:ios      # Preview iOS build (simulator)
+# npm run build:preview:android  # Preview Android build (APK)
+# npm run update                 # Publish OTA update
+
+# Last verified: January 11, 2026
+# Status: ✅ Fully configured and linked
