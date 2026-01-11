@@ -1,5 +1,4 @@
-import { supabase } from './supabase';
-import { FunctionsHttpError, FunctionsRelayError, FunctionsFetchError } from '@supabase/supabase-js';
+import { supabase, supabaseUrl, supabaseAnonKey } from './supabase';
 
 export interface AnalyzeInput {
   url?: string;
@@ -65,15 +64,20 @@ export class BunkdAPI {
     return session;
   }
 
-  private static async callFunction<T>(
+  private static async callEdgeFunction<T>(
     functionName: string,
-    body?: any,
-    params?: Record<string, string>
+    options: {
+      method?: 'GET' | 'POST';
+      body?: any;
+      query?: Record<string, string>;
+    } = {}
   ): Promise<T> {
+    const { method = 'POST', body, query } = options;
+
     // Ensure we have a valid session
     const session = await this.ensureSession();
 
-    console.log(`[BunkdAPI] ========== CALLING FUNCTION: ${functionName} ==========`);
+    console.log(`[BunkdAPI] ========== CALLING EDGE FUNCTION: ${functionName} ==========`);
     console.log(`[BunkdAPI] Session status:`, {
       hasSession: true,
       userId: session.user.id,
@@ -82,76 +86,78 @@ export class BunkdAPI {
       tokenLength: session.access_token.length,
       expiresAt: new Date(session.expires_at! * 1000).toISOString(),
     });
-    console.log(`[BunkdAPI] Request body:`, JSON.stringify(body, null, 2));
+    console.log(`[BunkdAPI] Method:`, method);
+    console.log(`[BunkdAPI] Request body:`, body ? JSON.stringify(body, null, 2) : 'none');
 
-    const { data, error } = await supabase.functions.invoke(functionName, {
-      body,
-      headers: {
-        Authorization: `Bearer ${session.access_token}`,
-      },
-      ...(params && { method: 'GET' }),
-    });
-
-    console.log(`[BunkdAPI] Response status:`, error ? 'ERROR' : 'SUCCESS');
-    console.log(`[BunkdAPI] Response data:`, data);
-    if (error) {
-      console.log(`[BunkdAPI] Response error:`, error);
+    // Build URL with query params if provided
+    let url = `${supabaseUrl}/functions/v1/${functionName}`;
+    if (query) {
+      const params = new URLSearchParams(query);
+      url += `?${params.toString()}`;
     }
 
-    if (error) {
-      // Extract detailed error information
-      let errorMessage = `API Error: ${error.message}`;
-      let errorDetails = '';
+    const headers: Record<string, string> = {
+      'apikey': supabaseAnonKey,
+      'Authorization': `Bearer ${session.access_token}`,
+      'Content-Type': 'application/json',
+    };
 
-      try {
-        if (error instanceof FunctionsHttpError) {
-          // Edge Function returned non-2xx status
-          const responseBody = await error.context.json().catch(() =>
-            error.context.text().catch(() => null)
-          );
+    const fetchOptions: RequestInit = {
+      method,
+      headers,
+    };
 
-          console.error(`[BunkdAPI] FunctionsHttpError details:`, {
-            status: error.context.status,
-            statusText: error.context.statusText,
-            body: responseBody,
-          });
-
-          if (responseBody) {
-            if (typeof responseBody === 'object') {
-              errorDetails = responseBody.error || responseBody.message || JSON.stringify(responseBody);
-              if (responseBody.details) errorDetails += `\n${responseBody.details}`;
-              if (responseBody.hint) errorDetails += `\nHint: ${responseBody.hint}`;
-            } else {
-              errorDetails = String(responseBody);
-            }
-            errorMessage = `API Error (${error.context.status}): ${errorDetails}`;
-          } else {
-            errorMessage = `API Error: Edge Function returned status ${error.context.status} (${error.context.statusText})`;
-          }
-        } else if (error instanceof FunctionsRelayError) {
-          console.error(`[BunkdAPI] FunctionsRelayError:`, error.message);
-          errorMessage = `Relay Error: ${error.message}`;
-        } else if (error instanceof FunctionsFetchError) {
-          console.error(`[BunkdAPI] FunctionsFetchError:`, error.message);
-          errorMessage = `Network Error: ${error.message}`;
-        }
-      } catch (parseError) {
-        console.error(`[BunkdAPI] Error parsing error response:`, parseError);
-      }
-
-      throw new Error(errorMessage);
+    if (method === 'POST' && body) {
+      fetchOptions.body = JSON.stringify(body);
     }
 
+    console.log(`[BunkdAPI] Fetching URL:`, url);
+
+    const response = await fetch(url, fetchOptions);
+    const responseText = await response.text();
+
+    console.log(`[BunkdAPI] Response status:`, response.status, response.statusText);
+    console.log(`[BunkdAPI] Response body (raw):`, responseText);
+
+    let data: any;
+    try {
+      data = responseText ? JSON.parse(responseText) : null;
+    } catch (parseError) {
+      console.error(`[BunkdAPI] Failed to parse response as JSON:`, parseError);
+      data = responseText;
+    }
+
+    if (!response.ok) {
+      const errorMessage =
+        typeof data === 'object' && data
+          ? data.error || data.message || JSON.stringify(data)
+          : String(data || response.statusText);
+
+      const details =
+        typeof data === 'object' && data?.details ? `\n${data.details}` : '';
+      const hint =
+        typeof data === 'object' && data?.hint ? `\nHint: ${data.hint}` : '';
+
+      console.error(`[BunkdAPI] API Error (${response.status}):`, errorMessage + details + hint);
+      throw new Error(`API Error (${response.status}): ${errorMessage}${details}${hint}`);
+    }
+
+    console.log(`[BunkdAPI] ✓ SUCCESS`);
     return data as T;
   }
 
   static async analyzeProduct(input: AnalyzeInput): Promise<AnalyzeResponse> {
-    return this.callFunction<AnalyzeResponse>('analyze_product', input);
+    return this.callEdgeFunction<AnalyzeResponse>('analyze_product', {
+      method: 'POST',
+      body: input,
+    });
   }
 
   static async getJobStatus(jobId: string): Promise<JobStatusResponse> {
-    // Use callFunction to ensure proper session handling
-    return this.callFunction<JobStatusResponse>(`job_status?job_id=${jobId}`, undefined, { _dummy: 'get' });
+    return this.callEdgeFunction<JobStatusResponse>('job_status', {
+      method: 'GET',
+      query: { job_id: jobId },
+    });
   }
 
   static async pollJobStatus(
