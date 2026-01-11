@@ -10,20 +10,47 @@ Worker service that polls Supabase for queued analysis jobs, calls Perplexity AP
 
 ## Required Environment Variables
 
-Create a `.env` file with:
+**No file editing required!** The worker automatically loads env from multiple locations:
+
+1. **Exported environment variables** (highest priority)
+2. `services/perplexity-worker/.env`
+3. Repo root `.env` (`~/bunkd/.env`)
+4. `supabase/.env`
+
+Required variables:
+- `SUPABASE_URL` - Your Supabase project URL
+- `SUPABASE_SERVICE_ROLE_KEY` - Get from: Dashboard → Settings → API → service_role
+- `PERPLEXITY_API_KEY` - Get from: https://www.perplexity.ai/settings/api
+
+Optional:
+- `PERPLEXITY_MODEL` (default: `llama-3.1-sonar-large-128k-online`)
+- `POLL_INTERVAL_MS` (default: `1500`)
+- `MAX_ATTEMPTS` (default: `3`)
+
+## Quick Start (Recommended)
+
+### Option 1: Export environment variables (preferred for local dev)
 
 ```bash
-# Supabase Configuration
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+# Export keys before running
+export SUPABASE_SERVICE_ROLE_KEY="eyJhbGc..."
+export PERPLEXITY_API_KEY="pplx-..."
 
-# Perplexity API
-PERPLEXITY_API_KEY=your-perplexity-api-key
-PERPLEXITY_MODEL=llama-3.1-sonar-large-128k-online
+cd services/perplexity-worker
+npm install
+./bin/dev.sh
+```
 
-# Worker Configuration (optional)
-POLL_INTERVAL_MS=1500
-MAX_ATTEMPTS=3
+### Option 2: Add to repo root .env
+
+```bash
+# Create or edit ~/bunkd/.env
+echo "SUPABASE_SERVICE_ROLE_KEY=eyJhbGc..." >> ~/.../bunkd/.env
+echo "PERPLEXITY_API_KEY=pplx-..." >> ~/.../bunkd/.env
+
+cd services/perplexity-worker
+npm install
+./bin/dev.sh
 ```
 
 ## Installation
@@ -35,7 +62,12 @@ npm install
 
 ## Running Locally
 
-### Development (with hot reload)
+### Development (with hot reload) - Recommended
+```bash
+./bin/dev.sh
+```
+
+Or manually:
 ```bash
 npm run dev
 ```
@@ -54,6 +86,24 @@ npm start
 4. **Score**: Parses response, computes Bunkd Score (0-10)
 5. **Write**: Updates job with status=done, bs_score, result_json
 6. **Retry**: On failure, requeues (status=queued) if attempts < MAX_ATTEMPTS
+
+## Startup Validation
+
+The worker validates environment variables on startup:
+- ✅ Logs safe prefixes (first 6 chars of service key, first 4 of API key)
+- ❌ Fails fast with helpful errors if keys are missing or placeholders
+- 📁 Shows which .env files were loaded
+
+Example success output:
+```
+✅ Environment loaded:
+  SUPABASE_URL: https://qmhqfmkbvyeabftpchex.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY: eyJhbG...
+  PERPLEXITY_API_KEY: pplx...
+  PERPLEXITY_MODEL: llama-3.1-sonar-large-128k-online
+
+🚀 Perplexity Worker started
+```
 
 ## Logs
 

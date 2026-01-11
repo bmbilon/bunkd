@@ -1,8 +1,22 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { request } from 'undici';
 import * as dotenv from 'dotenv';
+import * as path from 'path';
+import * as fs from 'fs';
 
-dotenv.config();
+// Load environment variables from multiple locations (later sources don't override)
+// Priority: process.env > worker/.env > repo/.env > supabase/.env
+const envPaths = [
+  path.join(__dirname, '..', '.env'),                    // services/perplexity-worker/.env
+  path.join(__dirname, '..', '..', '..', '.env'),        // repo root .env
+  path.join(__dirname, '..', '..', '..', 'supabase', '.env'), // supabase/.env
+];
+
+for (const envPath of envPaths) {
+  if (fs.existsSync(envPath)) {
+    dotenv.config({ path: envPath, override: false });
+  }
+}
 
 // Environment configuration
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
@@ -13,13 +27,41 @@ const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '1500', 10);
 const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || '3', 10);
 
 // Validate required env vars
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !PERPLEXITY_API_KEY) {
-  console.error('❌ Missing required environment variables:');
-  if (!SUPABASE_URL) console.error('  - SUPABASE_URL');
-  if (!SUPABASE_SERVICE_ROLE_KEY) console.error('  - SUPABASE_SERVICE_ROLE_KEY');
-  if (!PERPLEXITY_API_KEY) console.error('  - PERPLEXITY_API_KEY');
+const errors: string[] = [];
+
+if (!SUPABASE_URL) {
+  errors.push('  - SUPABASE_URL: Required');
+}
+
+if (!SUPABASE_SERVICE_ROLE_KEY || SUPABASE_SERVICE_ROLE_KEY === 'your-service-role-key-here') {
+  errors.push('  - SUPABASE_SERVICE_ROLE_KEY: Missing or placeholder');
+  errors.push('    Get it from: Supabase Dashboard → Settings → API → service_role');
+  errors.push('    Set via: export SUPABASE_SERVICE_ROLE_KEY=<key> OR add to repo .env');
+}
+
+if (!PERPLEXITY_API_KEY || PERPLEXITY_API_KEY === 'your-perplexity-api-key-here') {
+  errors.push('  - PERPLEXITY_API_KEY: Missing or placeholder');
+  errors.push('    Get it from: https://www.perplexity.ai/settings/api');
+  errors.push('    Set via: export PERPLEXITY_API_KEY=<key> OR add to repo .env');
+}
+
+if (errors.length > 0) {
+  console.error('❌ Missing or invalid required environment variables:\n');
+  errors.forEach(err => console.error(err));
+  console.error('\nEither export the variables or add them to a .env file in:');
+  console.error('  - services/perplexity-worker/.env');
+  console.error('  - repo root .env (~/bunkd/.env)');
+  console.error('  - supabase/.env');
   process.exit(1);
 }
+
+// Log safe prefixes (never full keys)
+console.log('✅ Environment loaded:');
+console.log(`  SUPABASE_URL: ${SUPABASE_URL}`);
+console.log(`  SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY.substring(0, 6)}...`);
+console.log(`  PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY.substring(0, 4)}...`);
+console.log(`  PERPLEXITY_MODEL: ${PERPLEXITY_MODEL}`);
+console.log('');
 
 // Types
 interface Job {
