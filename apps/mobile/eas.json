@@ -4,7 +4,6 @@
   },
   "build": {
     "production": {
-      "workingDirectory": "apps/mobile",
       "distribution": "store",
       "autoIncrement": true,
       "ios": {
@@ -15,14 +14,12 @@
       }
     },
     "preview": {
-      "workingDirectory": "apps/mobile",
       "distribution": "internal",
       "ios": {
         "simulator": true
       }
     },
     "development": {
-      "workingDirectory": "apps/mobile",
       "developmentClient": true,
       "distribution": "internal"
     }
