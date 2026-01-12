@@ -1,20 +1,11 @@
 {
   "cli": {
-    "version": ">= 7.0.0",
-    "appVersionSource": "remote"
+    "version": ">= 7.0.0"
   },
   "build": {
-    "development": {
-      "developmentClient": true,
-      "distribution": "internal"
-    },
-    "preview": {
-      "distribution": "internal",
-      "ios": {
-        "simulator": true
-      }
-    },
     "production": {
+      "workingDirectory": "apps/mobile",
+      "distribution": "store",
       "autoIncrement": true,
       "ios": {
         "buildConfiguration": "Release"
@@ -22,6 +13,18 @@
       "android": {
         "buildType": "apk"
       }
+    },
+    "preview": {
+      "workingDirectory": "apps/mobile",
+      "distribution": "internal",
+      "ios": {
+        "simulator": true
+      }
+    },
+    "development": {
+      "workingDirectory": "apps/mobile",
+      "developmentClient": true,
+      "distribution": "internal"
     }
   },
   "submit": {
