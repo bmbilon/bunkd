@@ -12,7 +12,11 @@
       "distribution": "internal"
     },
     "production": {
-      "autoIncrement": true
+      "autoIncrement": true,
+      "installCommand": "npm install && cd apps/mobile && npm install",
+      "cache": {
+        "disabled": true
+      }
     }
   },
   "submit": {
