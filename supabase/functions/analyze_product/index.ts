@@ -193,6 +193,28 @@ Deno.serve(async (req) => {
           );
         }
 
+        // If existing job is 'failed', reset it to 'queued' for retry
+        let finalStatus = existingJob.status;
+        if (existingJob.status === 'failed') {
+          console.log(`[${requestId}] Existing job is failed - resetting to queued for retry`);
+          const { error: resetError } = await supabase
+            .from("analysis_jobs")
+            .update({
+              status: 'queued',
+              attempts: 0,
+              last_error_code: null,
+              last_error_message: null,
+            })
+            .eq("id", existingJob.id);
+
+          if (resetError) {
+            console.error(`[${requestId}] Failed to reset job:`, resetError);
+            // Continue anyway - return failed status
+          } else {
+            finalStatus = 'queued';
+          }
+        }
+
         // If job_token is missing, generate and update
         let jobToken = existingJob.job_token;
         if (!jobToken) {
@@ -210,12 +232,12 @@ Deno.serve(async (req) => {
           }
         }
 
-        console.log(`[${requestId}] ✓ Returning existing job ${existingJob.id} (status: ${existingJob.status})`);
+        console.log(`[${requestId}] ✓ Returning existing job ${existingJob.id} (status: ${finalStatus})`);
         const elapsed = Date.now() - startTime;
 
         return new Response(
           JSON.stringify({
-            status: existingJob.status,
+            status: finalStatus,
             job_id: existingJob.id,
             job_token: jobToken,
           }),

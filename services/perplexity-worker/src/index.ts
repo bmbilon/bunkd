@@ -90,6 +90,28 @@ interface PerplexityResponse {
   citations?: string[];
 }
 
+interface BunkdAnalysisResult {
+  version: "bunkd_v1";
+  bunk_score: number;
+  confidence: number;
+  verdict: "low" | "elevated" | "high";
+  summary: string;
+  evidence_bullets: string[];
+  key_claims: Array<{
+    claim: string;
+    support_level: "supported" | "mixed" | "weak" | "unsupported";
+    why: string;
+  }>;
+  red_flags: string[];
+  subscores: {
+    human_evidence: number;
+    authenticity_transparency: number;
+    marketing_overclaim: number;
+    pricing_value: number;
+  };
+  citations: Array<{ title: string; url: string }>;
+}
+
 // Initialize Supabase client
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -98,39 +120,122 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Build prompt for Perplexity
-function buildPrompt(inputType: string, normalizedInput: string): string {
-  const systemPrompt = `You are a fact-checking assistant. Analyze the given content and provide:
-1. A Bunkd Score (0-10 scale where 0 is completely false/misleading, 10 is completely factual)
-2. Key factual claims identified
-3. Evidence and reasoning for your assessment
-4. Any red flags or concerns
+// Round to nearest 0.5
+function roundToHalf(num: number): number {
+  return Math.round(num * 2) / 2;
+}
 
-Respond in JSON format with this structure:
-{
-  "bunkd_score": <number 0-10>,
-  "summary": "<brief summary>",
-  "factual_claims": [{"claim": "...", "verified": true/false, "confidence": 0-1}],
-  "bias_indicators": ["indicator1", "indicator2"],
-  "reasoning": "<explanation of score>"
-}`;
+// Compute deterministic bunk_score from subscores
+function computeBunkScore(subscores: {
+  human_evidence: number;
+  authenticity_transparency: number;
+  marketing_overclaim: number;
+  pricing_value: number;
+}): number {
+  return roundToHalf(
+    0.4 * subscores.human_evidence +
+    0.25 * subscores.authenticity_transparency +
+    0.25 * subscores.marketing_overclaim +
+    0.10 * subscores.pricing_value
+  );
+}
+
+// Compute verdict from bunk_score
+function verdictFromScore(score: number): "low" | "elevated" | "high" {
+  if (score <= 3.5) return "low";
+  if (score <= 6.5) return "elevated";
+  return "high";
+}
+
+// Build Perplexity request body with strict JSON schema
+export function buildPerplexityRequestBody(input: {
+  input_type: "url" | "text" | "image";
+  input_value: string;
+  normalized_input?: string;
+  cache_key?: string;
+}): object {
+  const normalizedInput = input.normalized_input || input.input_value;
+
+  const systemMessage = `You are a product analysis research engine for Bunkd. Output a plain-text report using the exact format below.
+
+REQUIRED OUTPUT FORMAT:
+
+BUNKD_V1
+SUMMARY:
+<1-3 sentences on one line>
+EVIDENCE_BULLETS:
+- <bullet 1>
+- <bullet 2>
+- <bullet 3>
+- <bullet 4>
+- <bullet 5>
+SUBSCORES:
+human_evidence=<number 0-10>
+authenticity_transparency=<number 0-10>
+marketing_overclaim=<number 0-10>
+pricing_value=<number 0-10>
+KEY_CLAIMS:
+- <claim> | <supported|mixed|weak|unsupported> | <why>
+- <claim> | <supported|mixed|weak|unsupported> | <why>
+- <claim> | <supported|mixed|weak|unsupported> | <why>
+RED_FLAGS:
+- <flag 1>
+- <flag 2>
+- <flag 3>
+CITATIONS:
+- <title> | <url>
+- <title> | <url>
+- <title> | <url>
+- <title> | <url>
+
+SCORING RUBRIC (higher = more bunk):
+- human_evidence (0-10): 0 = strong RCTs/studies; 10 = no human evidence
+- authenticity_transparency (0-10): 0 = COA/third-party tested; 10 = no transparency
+- marketing_overclaim (0-10): 0 = claims match evidence; 10 = claims far exceed evidence
+- pricing_value (0-10): 0 = fair value; 10 = predatory pricing
+
+RULES:
+- Output MUST contain ALL section headers exactly once
+- Provide 5-10 evidence bullets
+- Provide 3-8 key claims
+- Provide 3-8 red flags
+- Provide at least 4 citations
+- ALL subscores must use 0.5 increments (e.g., 7.5, 8.0, 8.5)
+- No JSON. No markdown fences. No extra preamble.
+- Start output with BUNKD_V1 on first line`;
 
   let userMessage: string;
-  if (inputType === 'url') {
-    userMessage = `Analyze the content at this URL: ${normalizedInput}`;
-  } else if (inputType === 'text') {
-    userMessage = `Analyze this text: ${normalizedInput}`;
-  } else if (inputType === 'image') {
+  if (input.input_type === 'url') {
+    userMessage = `Analyze this product page URL: ${normalizedInput}`;
+  } else if (input.input_type === 'text') {
+    userMessage = `Analyze these claims: ${normalizedInput}`;
+  } else if (input.input_type === 'image') {
     userMessage = `[Image analysis not yet implemented] URL: ${normalizedInput}`;
   } else {
     userMessage = normalizedInput;
   }
 
-  return `${systemPrompt}\n\n${userMessage}`;
+  return {
+    model: "sonar-pro",
+    messages: [
+      {
+        role: "system",
+        content: systemMessage,
+      },
+      {
+        role: "user",
+        content: userMessage,
+      },
+    ],
+    temperature: 0.1,
+    max_tokens: 700,
+  };
 }
 
-// Call Perplexity API with retries
-async function callPerplexity(prompt: string, attempt: number = 1): Promise<{ response: PerplexityResponse, latencyMs: number }> {
+// Removed old validateAnalysisResult - now using parseBunkdReport for text-based parsing
+
+// Call Perplexity API with request body
+async function callPerplexity(requestBody: object): Promise<{ response: PerplexityResponse, latencyMs: number }> {
   const startTime = Date.now();
   const maxRetries = 2;
 
@@ -142,19 +247,9 @@ async function callPerplexity(prompt: string, attempt: number = 1): Promise<{ re
           'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          model: PERPLEXITY_MODEL,
-          messages: [
-            {
-              role: 'user',
-              content: prompt,
-            },
-          ],
-          temperature: 0.2,
-          max_tokens: 1500,
-        }),
-        headersTimeout: 30000,
-        bodyTimeout: 30000,
+        body: JSON.stringify(requestBody),
+        headersTimeout: 60000,
+        bodyTimeout: 60000,
       });
 
       const responseText = await body.text();
@@ -169,10 +264,24 @@ async function callPerplexity(prompt: string, attempt: number = 1): Promise<{ re
       return { response, latencyMs };
 
     } catch (error: any) {
+      const isTimeoutError = error.message?.includes('Timeout') ||
+                            error.message?.includes('timeout') ||
+                            error.name === 'AbortError' ||
+                            error.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+                            error.code === 'UND_ERR_BODY_TIMEOUT';
+
       const isLastRetry = retry === maxRetries;
 
-      if (isLastRetry) {
+      // Timeout errors are retryable once
+      if (isLastRetry && !isTimeoutError) {
         throw error;
+      }
+
+      // If timeout on last retry, give it one more chance
+      if (isTimeoutError && isLastRetry) {
+        console.warn(`  ⚠️  Timeout detected on retry ${retry + 1}/${maxRetries}, retrying once more:`, error.message);
+        await sleep(2000);
+        continue;
       }
 
       console.warn(`  ⚠️  Perplexity call failed (retry ${retry + 1}/${maxRetries}):`, error.message);
@@ -183,88 +292,380 @@ async function callPerplexity(prompt: string, attempt: number = 1): Promise<{ re
   throw new Error('Perplexity retries exhausted');
 }
 
-// Parse and extract Bunkd Score from response
-function extractBunkdScore(content: string): { score: number; resultJson: any } {
-  try {
-    // Try to extract JSON from markdown code blocks
-    const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) || content.match(/```\s*([\s\S]*?)\s*```/);
-    const jsonText = jsonMatch ? jsonMatch[1] : content;
+// Parse Bunkd report format
+function parseBunkdReport(text: string): {
+  valid: boolean;
+  result?: any;
+  errors: string[];
+  missingHeaders?: string[];
+} {
+  const errors: string[] = [];
+  const missingHeaders: string[] = [];
 
-    const parsed = JSON.parse(jsonText);
+  // Required headers
+  const requiredHeaders = [
+    'BUNKD_V1',
+    'SUMMARY:',
+    'EVIDENCE_BULLETS:',
+    'SUBSCORES:',
+    'KEY_CLAIMS:',
+    'RED_FLAGS:',
+    'CITATIONS:'
+  ];
 
-    // Extract bunkd_score (validate it's 0-10)
-    let score = parsed.bunkd_score || parsed.score || 5.0;
-    score = Math.max(0, Math.min(10, parseFloat(score)));
+  // Check for all required headers
+  for (const header of requiredHeaders) {
+    if (!text.includes(header)) {
+      missingHeaders.push(header);
+    }
+  }
 
+  if (missingHeaders.length > 0) {
     return {
-      score: Math.round(score * 10) / 10, // Round to 1 decimal
-      resultJson: parsed,
+      valid: false,
+      errors: [`Missing required headers: ${missingHeaders.join(', ')}`],
+      missingHeaders
     };
-  } catch (error) {
-    console.error('  Failed to parse Perplexity response as JSON:', error);
+  }
 
-    // Fallback: simple keyword-based scoring
-    const lower = content.toLowerCase();
-    let score = 5.0; // Default neutral
+  try {
+    // Extract sections
+    const lines = text.split('\n').map(l => l.trim());
 
-    if (lower.includes('false') || lower.includes('misleading') || lower.includes('unverified')) {
-      score -= 2.0;
-    }
-    if (lower.includes('true') || lower.includes('verified') || lower.includes('accurate')) {
-      score += 2.0;
-    }
-    if (lower.includes('partially') || lower.includes('some truth')) {
-      score = 5.0;
+    // Extract SUMMARY
+    const summaryIdx = lines.findIndex(l => l.startsWith('SUMMARY:'));
+    const evidenceIdx = lines.findIndex(l => l === 'EVIDENCE_BULLETS:');
+
+    let summary = '';
+    if (summaryIdx >= 0) {
+      // Check if summary is on the same line as the header
+      const summaryLine = lines[summaryIdx];
+      if (summaryLine.length > 'SUMMARY:'.length) {
+        summary = summaryLine.substring('SUMMARY:'.length).trim();
+      }
+
+      // Also capture any following lines until the next header
+      if (evidenceIdx > summaryIdx + 1) {
+        const extraLines = lines.slice(summaryIdx + 1, evidenceIdx)
+          .filter(l => l.length > 0 && !l.endsWith(':'))
+          .join(' ')
+          .trim();
+        if (extraLines) {
+          summary = summary ? `${summary} ${extraLines}` : extraLines;
+        }
+      }
     }
 
-    score = Math.max(0, Math.min(10, score));
+    if (!summary) {
+      errors.push('SUMMARY section is empty');
+    }
+
+    // Extract EVIDENCE_BULLETS
+    const subscoresIdx = lines.findIndex(l => l === 'SUBSCORES:');
+    const evidenceBullets = evidenceIdx >= 0 && subscoresIdx > evidenceIdx
+      ? lines.slice(evidenceIdx + 1, subscoresIdx)
+          .filter(l => l.startsWith('-'))
+          .map(l => l.substring(1).trim())
+      : [];
+
+    if (evidenceBullets.length < 5 || evidenceBullets.length > 10) {
+      errors.push(`EVIDENCE_BULLETS must have 5-10 items (got ${evidenceBullets.length})`);
+    }
+
+    // Extract SUBSCORES
+    const keyClaimsIdx = lines.findIndex(l => l === 'KEY_CLAIMS:');
+    const subscoreLines = subscoresIdx >= 0 && keyClaimsIdx > subscoresIdx
+      ? lines.slice(subscoresIdx + 1, keyClaimsIdx)
+      : [];
+
+    const subscores: any = {};
+    const subscoreNames = ['human_evidence', 'authenticity_transparency', 'marketing_overclaim', 'pricing_value'];
+
+    for (const line of subscoreLines) {
+      for (const name of subscoreNames) {
+        if (line.startsWith(name + '=')) {
+          const value = parseFloat(line.split('=')[1]);
+          if (isNaN(value) || value < 0 || value > 10) {
+            errors.push(`${name} must be 0-10 (got ${line.split('=')[1]})`);
+          } else if ((value * 2) % 1 !== 0) {
+            errors.push(`${name} must use 0.5 increments (got ${value})`);
+          } else {
+            subscores[name] = value;
+          }
+        }
+      }
+    }
+
+    if (Object.keys(subscores).length !== 4) {
+      errors.push(`SUBSCORES must have all 4 values (got ${Object.keys(subscores).length})`);
+    }
+
+    // Extract KEY_CLAIMS
+    const redFlagsIdx = lines.findIndex(l => l === 'RED_FLAGS:');
+    const keyClaimLines = keyClaimsIdx >= 0 && redFlagsIdx > keyClaimsIdx
+      ? lines.slice(keyClaimsIdx + 1, redFlagsIdx)
+          .filter(l => l.startsWith('-'))
+      : [];
+
+    const keyClaims = keyClaimLines.map(line => {
+      const parts = line.substring(1).split('|').map(p => p.trim());
+      if (parts.length >= 3) {
+        return {
+          claim: parts[0],
+          support_level: parts[1],
+          why: parts[2]
+        };
+      }
+      return null;
+    }).filter(c => c !== null);
+
+    if (keyClaims.length < 3 || keyClaims.length > 8) {
+      errors.push(`KEY_CLAIMS must have 3-8 items (got ${keyClaims.length})`);
+    }
+
+    // Extract RED_FLAGS
+    const citationsIdx = lines.findIndex(l => l === 'CITATIONS:');
+    const redFlags = redFlagsIdx >= 0 && citationsIdx > redFlagsIdx
+      ? lines.slice(redFlagsIdx + 1, citationsIdx)
+          .filter(l => l.startsWith('-'))
+          .map(l => l.substring(1).trim())
+      : [];
+
+    if (redFlags.length < 3 || redFlags.length > 8) {
+      errors.push(`RED_FLAGS must have 3-8 items (got ${redFlags.length})`);
+    }
+
+    // Extract CITATIONS
+    const citationLines = citationsIdx >= 0
+      ? lines.slice(citationsIdx + 1)
+          .filter(l => l.startsWith('-'))
+      : [];
+
+    const citations = citationLines.map(line => {
+      const parts = line.substring(1).split('|').map(p => p.trim());
+      if (parts.length >= 2) {
+        return { title: parts[0], url: parts[1] };
+      }
+      return null;
+    }).filter(c => c !== null);
+
+    // Note: citations can be 0+, but low citation count will reduce confidence
+    // This is handled in parseAndValidateResponse
+
+    if (errors.length > 0) {
+      return { valid: false, errors };
+    }
 
     return {
-      score: Math.round(score * 10) / 10,
-      resultJson: {
-        summary: content.slice(0, 500),
-        bunkd_score: score,
-        factual_claims: [],
-        bias_indicators: [],
-        reasoning: 'Fallback scoring due to parse error',
+      valid: true,
+      result: {
+        version: 'bunkd_v1',
+        summary,
+        evidence_bullets: evidenceBullets,
+        subscores,
+        key_claims: keyClaims,
+        red_flags: redFlags,
+        citations
       },
+      errors: []
+    };
+
+  } catch (error: any) {
+    return {
+      valid: false,
+      errors: [`Parse error: ${error.message}`]
     };
   }
 }
 
-// Process a single job
+// Parse and validate response content using report format
+function parseAndValidateResponse(rawContent: string): {
+  valid: boolean;
+  result?: BunkdAnalysisResult;
+  errors: string[];
+  extractedContent?: string;
+  missingHeaders?: string[];
+} {
+  try {
+    // Step 1: Try to extract content from envelope if present
+    let content = rawContent;
+    try {
+      const envelope = JSON.parse(rawContent);
+      if (envelope.choices && envelope.choices[0]?.message?.content) {
+        content = envelope.choices[0].message.content;
+      }
+    } catch {
+      // Not a JSON envelope, use rawContent as-is
+      content = rawContent;
+    }
+
+    // Step 2: Parse Bunkd report format
+    const parseResult = parseBunkdReport(content);
+
+    if (!parseResult.valid) {
+      return {
+        valid: false,
+        errors: parseResult.errors,
+        extractedContent: content,
+        missingHeaders: parseResult.missingHeaders
+      };
+    }
+
+    // Step 3: Compute bunk_score and verdict deterministically
+    const computedScore = computeBunkScore(parseResult.result.subscores);
+    const computedVerdict = verdictFromScore(computedScore);
+
+    // Step 4: Adjust confidence and red_flags based on citation count
+    let confidence = 0.7; // Default confidence
+    let redFlags = [...parseResult.result.red_flags];
+
+    if (parseResult.result.citations.length < 2) {
+      confidence = Math.min(confidence, 0.6);
+      redFlags.push('Limited citations returned; treat evidence strength cautiously.');
+    }
+
+    // Step 5: Build final result with computed values
+    const finalResult: BunkdAnalysisResult = {
+      version: 'bunkd_v1',
+      bunk_score: computedScore,
+      confidence: confidence,
+      verdict: computedVerdict,
+      summary: parseResult.result.summary,
+      evidence_bullets: parseResult.result.evidence_bullets,
+      subscores: parseResult.result.subscores,
+      key_claims: parseResult.result.key_claims,
+      red_flags: redFlags,
+      citations: parseResult.result.citations
+    };
+
+    return {
+      valid: true,
+      result: finalResult,
+      errors: [],
+      extractedContent: content
+    };
+
+  } catch (error: any) {
+    return {
+      valid: false,
+      errors: [`Unexpected error: ${error.message}`],
+      extractedContent: rawContent.substring(0, 200)
+    };
+  }
+}
+
+// Process a single job with validation and retry
 async function processJob(job: Job): Promise<void> {
   console.log(`[${job.id.substring(0, 8)}] Processing job (attempt ${job.attempts})`);
   console.log(`  Input type: ${job.input_type}`);
   console.log(`  Input length: ${job.normalized_input.length}`);
 
   try {
-    // Build prompt
-    const prompt = buildPrompt(job.input_type, job.normalized_input);
+    // Build request body
+    const requestBody = buildPerplexityRequestBody({
+      input_type: job.input_type as "url" | "text" | "image",
+      input_value: job.input_value,
+      normalized_input: job.normalized_input,
+      cache_key: job.cache_key,
+    });
 
-    // Call Perplexity
-    console.log(`  Calling Perplexity (model: ${PERPLEXITY_MODEL})...`);
-    const { response, latencyMs } = await callPerplexity(prompt, job.attempts);
+    // Log first 120 chars of user message to verify it's the target (not schema text)
+    const userMsg = (requestBody as any).messages?.find((m: any) => m.role === 'user')?.content || '';
+    console.log(`  User message preview: ${userMsg.substring(0, 120)}...`);
 
+    // Call Perplexity (initial attempt)
+    console.log(`  Calling Perplexity (model: sonar-pro)...`);
+    let { response, latencyMs } = await callPerplexity(requestBody);
     console.log(`  ✓ Perplexity responded in ${latencyMs}ms`);
 
     // Extract content
-    const content = response.choices[0]?.message?.content || '';
+    let content = response.choices[0]?.message?.content || '';
     if (!content) {
       throw new Error('Empty response from Perplexity');
     }
 
-    // Parse and score
-    const { score, resultJson } = extractBunkdScore(content);
-    console.log(`  ✓ Bunkd Score: ${score}`);
+    // Parse and validate
+    let parseResult = parseAndValidateResponse(content);
+
+    // If validation failed, retry ONCE with replacement message
+    if (!parseResult.valid) {
+      console.warn(`  ⚠️  Schema validation failed (${parseResult.errors.length} errors):`);
+      parseResult.errors.forEach(err => console.warn(`     - ${err}`));
+
+      // Log extracted content and missing headers
+      if (parseResult.extractedContent) {
+        console.warn(`  Content preview (first 200 chars): ${parseResult.extractedContent.substring(0, 200)}`);
+      }
+      if (parseResult.missingHeaders && parseResult.missingHeaders.length > 0) {
+        console.warn(`  Missing headers: ${parseResult.missingHeaders.join(', ')}`);
+      }
+
+      console.log(`  Retrying with strict replacement message...`);
+
+      // Replace the user message entirely (do NOT append)
+      const originalMessages = (requestBody as any).messages || [];
+      const systemMessage = originalMessages.find((m: any) => m.role === 'system');
+
+      const strictUserMessage = job.input_type === 'url'
+        ? `RETRY: Output the exact BUNKD_V1 format with all required headers. No extra text. Analyze this URL: ${job.normalized_input}`
+        : `RETRY: Output the exact BUNKD_V1 format with all required headers. No extra text. Analyze these claims: ${job.normalized_input}`;
+
+      const retryBody = {
+        ...requestBody,
+        messages: [
+          systemMessage,
+          {
+            role: "user",
+            content: strictUserMessage,
+          },
+        ],
+      };
+
+      const retryResponse = await callPerplexity(retryBody);
+      response = retryResponse.response;
+      latencyMs = retryResponse.latencyMs;
+      content = response.choices[0]?.message?.content || '';
+
+      console.log(`  ✓ Retry response received in ${latencyMs}ms`);
+
+      // Validate retry response
+      parseResult = parseAndValidateResponse(content);
+
+      if (!parseResult.valid) {
+        console.error(`  ❌ Retry validation failed (${parseResult.errors.length} errors):`);
+        parseResult.errors.forEach(err => console.error(`     - ${err}`));
+
+        // Log extracted content on retry failure
+        if (parseResult.extractedContent) {
+          console.error(`  Retry content preview (first 200 chars): ${parseResult.extractedContent.substring(0, 200)}`);
+        }
+
+        // Mark job as failed (do NOT requeue endlessly)
+        const errorMessage = `Schema validation failed after retry: ${parseResult.errors.join('; ')}`;
+        await supabase
+          .from('analysis_jobs')
+          .update({
+            status: 'failed',
+            last_error_code: 'SCHEMA_VALIDATION_FAILED',
+            last_error_message: errorMessage,
+          })
+          .eq('id', job.id);
+
+        throw new Error(errorMessage);
+      }
+    }
+
+    const result = parseResult.result!;
+    console.log(`  ✓ Subscores received: HE=${result.subscores.human_evidence}, AT=${result.subscores.authenticity_transparency}, MO=${result.subscores.marketing_overclaim}, PV=${result.subscores.pricing_value}`);
+    console.log(`  ✓ Computed Bunk Score: ${result.bunk_score} | Verdict: ${result.verdict}`);
 
     // Update job to done
     const { error: updateError } = await supabase
       .from('analysis_jobs')
       .update({
         status: 'done',
-        bs_score: score,
-        result_json: resultJson,
+        bs_score: result.bunk_score,
+        result_json: result,
         model_used: response.model,
         perplexity_latency_ms: latencyMs,
       })
@@ -279,6 +680,18 @@ async function processJob(job: Job): Promise<void> {
 
   } catch (error: any) {
     console.error(`  ❌ Job failed:`, error.message);
+
+    // Check if job was already marked as failed (e.g., by schema validation)
+    const { data: currentJob } = await supabase
+      .from('analysis_jobs')
+      .select('status')
+      .eq('id', job.id)
+      .single();
+
+    if (currentJob?.status === 'failed') {
+      console.log(`  Job already marked as failed, skipping update`);
+      return;
+    }
 
     // Determine if should retry
     const shouldRetry = job.attempts < MAX_ATTEMPTS;
@@ -304,7 +717,7 @@ async function processJob(job: Job): Promise<void> {
 // Main poll loop
 async function pollLoop(): Promise<void> {
   console.log('🚀 Perplexity Worker started');
-  console.log(`   Model: ${PERPLEXITY_MODEL}`);
+  console.log(`   Model: sonar-pro (strict JSON mode)`);
   console.log(`   Poll interval: ${POLL_INTERVAL_MS}ms`);
   console.log(`   Max attempts: ${MAX_ATTEMPTS}`);
   console.log('');

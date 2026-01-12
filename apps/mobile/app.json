@@ -24,7 +24,10 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.execominc.bunkd"
+      "bundleIdentifier": "com.execominc.bunkd",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "com.execominc.bunkd",
