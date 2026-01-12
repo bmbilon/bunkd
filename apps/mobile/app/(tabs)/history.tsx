@@ -56,15 +56,21 @@ export default function HistoryScreen() {
         console.error('Error loading history:', error);
       } else if (data) {
         // Transform data
-        const items: HistoryItem[] = data.map((item: any) => ({
-          id: item.id,
-          input_type: item.input_type,
-          input_value: item.input_value,
-          created_at: item.created_at,
-          job_id: item.job_id,
-          analysis_status: item.analysis_jobs?.status,
-          bunkd_score: item.analysis_jobs?.analysis_results?.[0]?.result_data?.objectivity_score,
-        }));
+        const items: HistoryItem[] = data.map((item: any) => {
+          const resultData = item.analysis_jobs?.analysis_results?.[0]?.result_data;
+          // Try multiple field names for the score
+          const score = resultData?.bs_score ?? resultData?.bunk_score ?? resultData?.bunkd_score;
+
+          return {
+            id: item.id,
+            input_type: item.input_type,
+            input_value: item.input_value,
+            created_at: item.created_at,
+            job_id: item.job_id,
+            analysis_status: item.analysis_jobs?.status,
+            bunkd_score: typeof score === 'number' ? score : undefined,
+          };
+        });
         setHistory(items);
       }
     } catch (error) {
@@ -136,6 +142,7 @@ export default function HistoryScreen() {
 
   const getStatusColor = (status?: string): string => {
     switch (status) {
+      case 'done':
       case 'completed':
         return '#34C759';
       case 'processing':
@@ -150,18 +157,21 @@ export default function HistoryScreen() {
   };
 
   const getScoreColor = (score?: number): string => {
-    if (!score) return '#999';
-    if (score >= 8) return '#34C759';
-    if (score >= 6) return '#FFD60A';
-    if (score >= 4) return '#FF9500';
-    return '#FF3B30';
+    if (!score && score !== 0) return '#999';
+    // INVERTED: Higher scores = weaker evidence = RED (bad)
+    // Lower scores = stronger evidence = GREEN (good)
+    if (score >= 9) return '#FF3B30'; // Red - Very High BS
+    if (score >= 7) return '#FF6B6B'; // Light Red - High BS
+    if (score >= 5) return '#FF9500'; // Orange - Elevated BS
+    if (score >= 3) return '#FFD60A'; // Yellow - Moderate BS
+    return '#34C759'; // Green - Low BS
   };
 
   const renderItem = ({ item }: { item: HistoryItem }) => (
     <TouchableOpacity
       style={styles.historyItem}
       onPress={() => handleItemPress(item)}
-      disabled={item.analysis_status !== 'completed'}
+      disabled={item.analysis_status !== 'done' && item.analysis_status !== 'completed'}
     >
       <View style={styles.itemHeader}>
         <View style={styles.itemTypeContainer}>
@@ -185,15 +195,15 @@ export default function HistoryScreen() {
             </Text>
           </View>
         )}
-        {item.objectivity_score !== undefined && (
+        {item.bunkd_score !== undefined && (
           <View style={styles.scoreContainer}>
             <Text
               style={[
                 styles.scoreText,
-                { color: getScoreColor(item.objectivity_score) },
+                { color: getScoreColor(item.bunkd_score) },
               ]}
             >
-              {item.objectivity_score.toFixed(1)}/10
+              {item.bunkd_score.toFixed(1)}/10
             </Text>
           </View>
         )}
