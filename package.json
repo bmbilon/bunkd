@@ -2,13 +2,15 @@
   "name": "bunkd",
   "version": "1.0.0",
   "private": true,
+  "packageManager": "yarn@1.22.22",
   "scripts": {
-    "mobile": "cd apps/mobile && npm start",
-    "mobile:ios": "cd apps/mobile && npm run ios",
-    "mobile:android": "cd apps/mobile && npm run android",
-    "web": "cd apps/web && npm run dev"
+    "mobile": "yarn workspace mobile start",
+    "mobile:ios": "yarn workspace mobile ios",
+    "mobile:android": "yarn workspace mobile android",
+    "web": "yarn workspace web dev"
   },
   "workspaces": [
-    "apps/*"
+    "apps/*",
+    "services/*"
   ]
 }

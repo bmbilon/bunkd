@@ -1,0 +1,34 @@
+# Exclude mobile app
+apps/mobile
+
+# Exclude services
+services
+
+# Exclude documentation
+docs
+
+# Exclude supabase
+supabase
+
+# Exclude node_modules (Vercel installs its own)
+node_modules
+**/node_modules
+
+# Exclude build outputs
+**/.next
+**/dist
+**/build
+**/.turbo
+
+# Exclude Expo files
+**/.expo
+**/ios
+**/android
+
+# Exclude git
+.git
+
+# Exclude lock files we don't need
+yarn.lock
+pnpm-lock.yaml
+apps/web/package-lock.json

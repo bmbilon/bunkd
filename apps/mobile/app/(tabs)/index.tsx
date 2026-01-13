@@ -232,7 +232,7 @@ export default function AnalyzeScreen() {
   return (
     <ScrollView style={styles.container}>
       <View style={styles.content}>
-        <Text style={styles.title}>Analyze Product</Text>
+        <Text style={styles.title}>Calculate BS (Bunkd Score)</Text>
         <Text style={styles.subtitle}>
           Get an objective analysis of marketing claims and bias
         </Text>

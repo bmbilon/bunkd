@@ -1,0 +1,4 @@
+{
+  "buildCommand": "cd landing && npm run build",
+  "outputDirectory": "landing/.next"
+}
