@@ -2,7 +2,6 @@
   "name": "bunkd",
   "version": "1.0.0",
   "private": true,
-  "packageManager": "npm@10.9.0",
   "scripts": {
     "mobile": "cd apps/mobile && npm start",
     "mobile:ios": "cd apps/mobile && npm run ios",
