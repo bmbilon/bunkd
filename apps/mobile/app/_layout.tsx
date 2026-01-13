@@ -2,8 +2,7 @@ import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
-import 'react-native-reanimated';
-
+// import 'react-native-reanimated'; // disabled to unblock EAS build
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useAuth } from '@/hooks/use-auth';
 import { AuthWarningBanner } from '@/components/auth-warning-banner';
