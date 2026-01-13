@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Bunkd - Find Your Perfect Roommate",
-  description: "The easiest way to find roommates and housing",
+  title: "Bunkd - The BS-Meter for the Internet",
+  description: "Paste any link. Get a BS score in 2 seconds. With receipts.",
 };
 
 export default function RootLayout({
