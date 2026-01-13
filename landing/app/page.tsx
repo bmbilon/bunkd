@@ -1,40 +1,35 @@
 export default function Home() {
   return (
-    <main style={{minHeight:'100vh', display:'grid', placeItems:'center', padding:'48px', fontFamily:'ui-sans-serif, system-ui'}}>
-      <div style={{maxWidth: 820, width:'100%'}}>
-        <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', gap:16, flexWrap:'wrap'}}>
-          <div style={{fontSize:28, fontWeight:800, letterSpacing:-0.5}}>bunkd</div>
-          <div style={{opacity:0.7}}>truth scanning for claims</div>
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center px-4">
+      <div className="max-w-4xl w-full text-center">
+        <div className="mb-8">
+          <h1 className="text-6xl font-bold text-gray-900 mb-4">
+            Bunkd
+          </h1>
+          <p className="text-2xl text-gray-700 mb-8">
+            Find your perfect roommate and housing match
+          </p>
+          <p className="text-lg text-gray-600 mb-12 max-w-2xl mx-auto">
+            Connect with compatible roommates, discover available housing, and make your next move stress-free.
+          </p>
         </div>
 
-        <div style={{marginTop:48, fontSize:52, fontWeight:900, letterSpacing:-1.2, lineHeight:1.05}}>
-          Call BS on product claims in seconds.
-        </div>
-
-        <div style={{marginTop:18, fontSize:18, opacity:0.8, lineHeight:1.6}}>
-          Paste a claim. Get a Bunkd Score with evidence, reasoning, and clear next questions.
-        </div>
-
-        <div style={{marginTop:28, display:'flex', gap:12, flexWrap:'wrap'}}>
-          <a href="/"
-            style={{display:'inline-flex', alignItems:'center', justifyContent:'center', padding:'12px 16px', borderRadius:14, background:'#111', color:'#fff', textDecoration:'none', fontWeight:700}}>
-            Get early access
+        <div className="flex flex-col sm:flex-row gap-4 justify-center items-center">
+          <a
+            href="#"
+            className="inline-flex items-center justify-center px-8 py-4 bg-black text-white rounded-xl font-semibold hover:bg-gray-800 transition-colors shadow-lg"
+          >
+            <svg className="w-6 h-6 mr-3" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/>
+            </svg>
+            Download on the App Store
           </a>
-          <a href="mailto:hello@bunkd.app"
-            style={{display:'inline-flex', alignItems:'center', justifyContent:'center', padding:'12px 16px', borderRadius:14, border:'1px solid rgba(0,0,0,0.15)', color:'#111', textDecoration:'none', fontWeight:700}}>
-            Contact
-          </a>
         </div>
 
-        <div style={{marginTop:56, padding:'18px 18px', border:'1px solid rgba(0,0,0,0.10)', borderRadius:18}}>
-          <div style={{fontWeight:800}}>Status</div>
-          <div style={{marginTop:6, opacity:0.8}}>Landing page is live. Next: wire signup + score demo.</div>
-        </div>
-
-        <div style={{marginTop:28, opacity:0.55, fontSize:13}}>
-          © {new Date().getFullYear()} bunkd
+        <div className="mt-16 text-gray-500 text-sm">
+          Coming soon to iOS
         </div>
       </div>
-    </main>
+    </div>
   );
 }
