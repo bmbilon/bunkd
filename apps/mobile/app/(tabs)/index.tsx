@@ -10,7 +10,7 @@ import {
   Alert,
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import { BunkdAPI, AnalysisResult } from '@/lib/api';
+import { BunkdAPI, AnalysisResult } from '../../lib/api';
 
 // Demo examples for quick testing
 const DEMO_EXAMPLES = {

@@ -13,7 +13,7 @@
     },
     "production": {
       "autoIncrement": true,
-      "installCommand": "npm install && cd apps/mobile && npm install",
+      "installCommand": "npm ci || npm install && node -e \"require.resolve('react-native-reanimated/package.json'); console.log('root has reanimated')\" && cd apps/mobile && npm ci || npm install && node -e \"require.resolve('react-native-reanimated/package.json'); console.log('apps/mobile has reanimated')\"",
       "cache": {
         "disabled": true
       }
