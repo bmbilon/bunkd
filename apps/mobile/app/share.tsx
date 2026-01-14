@@ -16,20 +16,49 @@ export default function ShareScreen() {
   const router = useRouter();
   const params = useLocalSearchParams();
 
-  // Parse result from params
-  const result: AnalysisResult = params.result
-    ? JSON.parse(params.result as string)
-    : null;
+  // Parse result from params with error handling
+  let result: AnalysisResult | null = null;
+  let parseError: string | null = null;
+
+  if (params.result) {
+    try {
+      result = JSON.parse(params.result as string);
+    } catch (e: any) {
+      parseError = e?.message || 'Failed to parse result data';
+      console.error('[ShareScreen] JSON parse error:', e);
+    }
+  }
 
   const [productName, setProductName] = useState('Product Analysis');
 
-  if (!result) {
+  if (!result || parseError) {
     return (
       <View style={styles.container}>
-        <Text style={styles.errorText}>No result data found</Text>
+        <View style={styles.content}>
+          <View style={styles.header}>
+            <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
+              <Text style={styles.backButtonText}>← Back</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.errorText}>
+            {parseError || 'No result data found'}
+          </Text>
+        </View>
       </View>
     );
   }
+
+  // Extract score from multiple possible field names (same as result.tsx)
+  const getScore = (): number | null => {
+    const data = (result as any).result_json || result;
+    if (data.unable_to_score === true) {
+      return null;
+    }
+    const scoreValue = (result as any).bs_score ?? (result as any).bunk_score ?? (result as any).bunkd_score;
+    return typeof scoreValue === 'number' ? scoreValue : null;
+  };
+
+  const score = getScore();
 
   const getScoreColor = (score: number): string => {
     // INVERTED: Higher scores = weaker evidence = RED (bad)
@@ -58,9 +87,9 @@ export default function ShareScreen() {
     return 'Claims have comprehensive supporting evidence';
   };
 
-  const scoreColor = getScoreColor(result.bunkd_score);
-  const scoreTier = getScoreTier(result.bunkd_score);
-  const verdict = getVerdict(result.bunkd_score);
+  const scoreColor = score !== null ? getScoreColor(score) : '#999';
+  const scoreTier = score !== null ? getScoreTier(score) : 'Unable to Score';
+  const verdict = score !== null ? getVerdict(score) : 'Insufficient data to evaluate claims';
   const currentDate = new Date().toLocaleDateString('en-US', {
     year: 'numeric',
     month: 'long',
@@ -69,9 +98,13 @@ export default function ShareScreen() {
 
   const handleShare = async () => {
     try {
+      const scoreText = score !== null
+        ? `BS Meter Score: ${score.toFixed(1)}/10 - ${scoreTier}`
+        : `BS Meter: Unable to Score`;
+
       const shareMessage = `${productName}
 
-BS Meter Score: ${result.bunkd_score.toFixed(1)}/10 - ${scoreTier}
+${scoreText}
 
 ${verdict}
 
@@ -125,7 +158,7 @@ Analyzed with Bunkd - BS Meter for product claims`;
           <View style={[styles.scoreContainer, { borderColor: scoreColor }]}>
             <Text style={styles.bsMeterLabel}>BS Meter</Text>
             <Text style={[styles.scoreValue, { color: scoreColor }]}>
-              {result.bunkd_score.toFixed(1)}/10
+              {score !== null ? `${score.toFixed(1)}/10` : 'N/A'}
             </Text>
             <Text style={[styles.scoreTier, { color: scoreColor }]}>{scoreTier}</Text>
           </View>

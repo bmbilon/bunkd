@@ -4,6 +4,19 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import * as fs from 'fs';
 
+// New scoring schema v2.0
+import {
+  CategoryId,
+  PrimitiveScores,
+  Signal,
+  BUNKD_SCORING_CONFIG,
+  scoreBSMeter,
+  extractPrimitivesFromText,
+  detectCategoryCandidates,
+  extractSignalsForCategory,
+  mapToLegacySubscores,
+} from './scoring-schema';
+
 // Load environment variables from multiple locations (later sources don't override)
 // Priority: process.env > worker/.env > repo/.env > supabase/.env
 const envPaths = [
@@ -92,9 +105,12 @@ interface PerplexityResponse {
 
 interface BunkdAnalysisResult {
   version: "bunkd_v1";
-  bunk_score: number;
+  scoring_version?: string; // "2.0" for new schema, optional for legacy fallback
+  bunk_score?: number; // Optional now - may not be set if insufficient data
   confidence: number;
-  verdict: "low" | "elevated" | "high";
+  verdict?: "low" | "elevated" | "high"; // Optional - only set when scoreable
+  unable_to_score?: boolean; // Flag for insufficient data
+  insufficient_data_reason?: string; // Explanation
   summary: string;
   evidence_bullets: string[];
   key_claims: Array<{
@@ -103,13 +119,32 @@ interface BunkdAnalysisResult {
     why: string;
   }>;
   red_flags: string[];
-  subscores: {
+  subscores: { // LEGACY - kept for backward compat with mobile app
     human_evidence: number;
     authenticity_transparency: number;
     marketing_overclaim: number;
     pricing_value: number;
   };
+  // NEW FIELDS for v2.0 scoring
+  category?: string; // Detected category ID
+  category_confidence?: number; // 0-1 confidence in category
+  pillar_scores?: PrimitiveScores; // New primitive breakdown
+  score_breakdown?: {
+    baseRisk01: number;
+    harmMultiplier: number;
+    penalties01: number;
+    credits01: number;
+    confidenceAdjusted01: number;
+  };
   citations: Array<{ title: string; url: string }>;
+  product_details?: {
+    name?: string;
+    ingredients?: string;
+    volume?: string;
+    price?: string;
+    clinical_studies?: string;
+  };
+  disclaimers?: string[];
 }
 
 // Initialize Supabase client
@@ -120,24 +155,164 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Fetch and extract text content from a URL
+async function fetchPageText(url: string): Promise<{ content: string; success: boolean; error?: string }> {
+  try {
+    const { statusCode, body } = await request(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; BunkdBot/1.0; +https://bunkd.ai)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      headersTimeout: 30000,
+      bodyTimeout: 30000,
+    });
+
+    if (statusCode !== 200) {
+      return { content: '', success: false, error: `HTTP ${statusCode}` };
+    }
+
+    const html = await body.text();
+
+    // Basic HTML to text conversion
+    let text = html
+      // Remove script and style tags
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+      // Remove HTML tags
+      .replace(/<[^>]+>/g, ' ')
+      // Decode HTML entities
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&ldquo;/g, '"')
+      .replace(/&rdquo;/g, '"')
+      .replace(/&rsquo;/g, "'")
+      .replace(/&#\d+;/g, ''); // Remove other numeric entities
+
+    // Normalize whitespace
+    text = text
+      .split('\n')
+      .map(line => line.replace(/\s+/g, ' ').trim())
+      .filter(line => line.length > 0)
+      .join('\n');
+
+    // Limit to reasonable length for prompt (keep under 50KB for the prompt)
+    const maxLength = 50000;
+    if (text.length > maxLength) {
+      text = text.substring(0, maxLength) + '\n... (content truncated)';
+    }
+
+    return { content: text, success: true };
+  } catch (error: any) {
+    return { content: '', success: false, error: error.message };
+  }
+}
+
 // Round to nearest 0.5
 function roundToHalf(num: number): number {
   return Math.round(num * 2) / 2;
 }
 
-// Compute deterministic bunk_score from subscores
-function computeBunkScore(subscores: {
-  human_evidence: number;
-  authenticity_transparency: number;
-  marketing_overclaim: number;
-  pricing_value: number;
-}): number {
+// Compute deterministic bunk_score from subscores with category-specific weights
+function computeBunkScore(
+  subscores: {
+    human_evidence: number;
+    authenticity_transparency: number;
+    marketing_overclaim: number;
+    pricing_value: number;
+  },
+  category: ProductCategory = 'unknown'
+): number {
+  const weights = CATEGORY_WEIGHTS[category];
+
   return roundToHalf(
-    0.4 * subscores.human_evidence +
-    0.25 * subscores.authenticity_transparency +
-    0.25 * subscores.marketing_overclaim +
-    0.10 * subscores.pricing_value
+    weights.he * subscores.human_evidence +
+    weights.at * subscores.authenticity_transparency +
+    weights.mo * subscores.marketing_overclaim +
+    weights.pv * subscores.pricing_value
   );
+}
+
+// Detect if there's insufficient data to score accurately
+function detectInsufficientData(result: any, pageContentLength?: number): {
+  insufficient: boolean;
+  reason?: string;
+} {
+  const reasons: string[] = [];
+
+  // Check 1: All subscores very high (suggests default "no data" scoring)
+  const { subscores } = result;
+  const allScoresHigh =
+    subscores.human_evidence >= 8.5 &&
+    subscores.authenticity_transparency >= 8.5 &&
+    subscores.marketing_overclaim >= 8.5 &&
+    subscores.pricing_value >= 8.5;
+
+  if (allScoresHigh) {
+    reasons.push('All quality indicators show maximum concern, suggesting insufficient product data to evaluate');
+  }
+
+  // Check 2: Very few claims
+  if (result.key_claims && result.key_claims.length < 3) {
+    reasons.push(`Only ${result.key_claims.length} product claims found (minimum 3 needed for analysis)`);
+  }
+
+  // Check 3: Summary indicates insufficient data
+  const summaryLower = result.summary?.toLowerCase() || '';
+  const insufficientKeywords = [
+    'insufficient',
+    'not enough data',
+    'not enough information',
+    'unable to',
+    'no product information',
+    'cannot evaluate',
+    'cannot assess',
+    'limited information',
+    'no specific product'
+  ];
+
+  const hasInsufficientKeyword = insufficientKeywords.some(keyword =>
+    summaryLower.includes(keyword)
+  );
+
+  if (hasInsufficientKeyword) {
+    reasons.push('Analysis summary indicates insufficient product information');
+  }
+
+  // Check 4: Product details all "Not specified" or missing
+  if (result.product_details) {
+    const details = result.product_details;
+    const allNotSpecified =
+      (!details.name || details.name.toLowerCase().includes('not specified')) &&
+      (!details.ingredients || details.ingredients.toLowerCase().includes('not specified')) &&
+      (!details.volume || details.volume.toLowerCase().includes('not specified')) &&
+      (!details.price || details.price.toLowerCase().includes('not specified'));
+
+    if (allNotSpecified) {
+      reasons.push('No product details (name, ingredients, volume, price) could be extracted');
+    }
+  }
+
+  // Check 5: Page content too short (if we fetched it)
+  if (pageContentLength !== undefined && pageContentLength < 500) {
+    reasons.push(`Page content too short (${pageContentLength} characters) for meaningful analysis`);
+  }
+
+  // Check 6: No evidence bullets or very few
+  if (result.evidence_bullets && result.evidence_bullets.length < 3) {
+    reasons.push(`Only ${result.evidence_bullets.length} evidence points found (minimum 5 expected)`);
+  }
+
+  const insufficient = reasons.length >= 2; // Need at least 2 indicators
+
+  return {
+    insufficient,
+    reason: insufficient ? reasons.join('; ') : undefined
+  };
 }
 
 // Compute verdict from bunk_score
@@ -147,89 +322,1424 @@ function verdictFromScore(score: number): "low" | "elevated" | "high" {
   return "high";
 }
 
-// Build Perplexity request body with strict JSON schema
+// =============================================================================
+// PHASE 1: Research Phase - Let Perplexity research freely
+// =============================================================================
+
+// Product categories for Phase 2 extraction
+type ProductCategory =
+  | 'supplement'
+  | 'beauty'
+  | 'tech'
+  | 'business_guru'
+  | 'health_device'
+  | 'food_beverage'
+  | 'automotive'
+  | 'real_estate'
+  | 'financial'
+  | 'education'
+  | 'travel'
+  | 'service'
+  | 'unknown';
+
+// =============================================================================
+// PACK SYSTEM - Category-specific scoring configuration
+// =============================================================================
+
+// Pillar types for the pack system
+type Pillar =
+  | 'claims_evidence'      // Are claims backed by studies/proof?
+  | 'safety_compliance'    // FDA, regulatory, safety certifications
+  | 'authenticity'         // Is this the real source? Official?
+  | 'transparency'         // Ingredient disclosure, pricing clarity
+  | 'value_integrity'      // Fair pricing, no hidden fees
+  | 'support_integrity';   // Return policy, customer service
+
+// Evidence types ordered by strength
+type EvidenceType =
+  | 'peer_reviewed'        // Published peer-reviewed study
+  | 'clinical_trial'       // Clinical trial (any size)
+  | 'product_clinical_trial' // Product-specific clinical trial
+  | 'ingredient_studies'   // Studies on ingredients
+  | 'third_party_test'     // Third-party lab testing
+  | 'manufacturer_study'   // In-house study
+  | 'dermatologist_tested' // Professional endorsement
+  | 'official_oem'         // Official manufacturer source
+  | 'authorized_dealer'    // Authorized reseller
+  | 'epa_verified'         // EPA fuel economy verification
+  | 'nhtsa_safety'         // NHTSA safety ratings
+  | 'verifiable_credentials' // Checkable credentials
+  | 'named_testimonials'   // Real, named testimonials
+  | 'public_track_record'  // Verifiable public history
+  | 'refund_policy'        // Clear refund/return policy
+  | 'user_testimonials'    // Anonymous testimonials (weakest)
+  | 'sec_registered'       // SEC registration
+  | 'finra_member'         // FINRA membership
+  | 'accredited'           // Educational accreditation
+  | 'licensed';            // Professional licensing
+
+// Auto-fail rule type
+interface AutoFailRule {
+  pattern: string;
+  penalty: number;
+  reason: string;
+}
+
+// Pack configuration type
+interface CategoryPack {
+  pillars: Pillar[];
+  weights: Partial<Record<Pillar, number>>;
+  red_flags: string[];
+  auto_fail_rules: AutoFailRule[];
+  evidence_priority: EvidenceType[];
+  default_pillar_scores?: Partial<Record<Pillar, number>>;
+}
+
+// Category packs configuration
+const CATEGORY_PACKS: Record<ProductCategory, CategoryPack> = {
+  supplement: {
+    pillars: ['claims_evidence', 'safety_compliance', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      claims_evidence: 0.35,
+      safety_compliance: 0.25,
+      transparency: 0.20,
+      value_integrity: 0.10,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'FDA approved', 'cures', 'treats disease', 'miracle', 'proprietary blend',
+      'clinically proven', '100% effective', 'no side effects', 'doctor recommended',
+      'secret formula', 'ancient remedy', 'big pharma doesn\'t want you to know',
+    ],
+    auto_fail_rules: [
+      { pattern: 'cures cancer|cures diabetes|cures alzheimer', penalty: 3.0, reason: 'Illegal disease cure claim' },
+      { pattern: 'FDA approved drug|FDA approved treatment', penalty: 2.5, reason: 'False FDA approval claim for supplement' },
+      { pattern: 'guaranteed results|money back if.{0,20}doesn\'t work', penalty: 1.5, reason: 'Unrealistic guarantee' },
+    ],
+    evidence_priority: ['peer_reviewed', 'clinical_trial', 'third_party_test', 'manufacturer_study', 'user_testimonials'],
+    default_pillar_scores: { claims_evidence: 7, safety_compliance: 6, transparency: 6, value_integrity: 5, support_integrity: 5 },
+  },
+
+  beauty: {
+    pillars: ['claims_evidence', 'safety_compliance', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      claims_evidence: 0.30,
+      safety_compliance: 0.20,
+      transparency: 0.25,
+      value_integrity: 0.15,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'instant results', 'celebrity secret', 'miracle', 'permanent', 'anti-aging breakthrough',
+      'erase wrinkles', 'look 10 years younger', 'botox alternative', 'surgery-free facelift',
+    ],
+    auto_fail_rules: [
+      { pattern: 'FDA approved cosmetic|FDA approved skincare', penalty: 2.0, reason: 'FDA doesn\'t approve cosmetics' },
+      { pattern: 'permanent results|forever young', penalty: 1.5, reason: 'Impossible permanence claim' },
+    ],
+    evidence_priority: ['product_clinical_trial', 'ingredient_studies', 'dermatologist_tested', 'third_party_test', 'user_testimonials'],
+    default_pillar_scores: { claims_evidence: 6, safety_compliance: 5, transparency: 5, value_integrity: 5, support_integrity: 5 },
+  },
+
+  automotive: {
+    pillars: ['authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      authenticity: 0.40,
+      transparency: 0.30,
+      value_integrity: 0.20,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'market adjustment', 'dealer markup', 'limited time', 'act now', 'won\'t last',
+      'below invoice', 'employee pricing', 'special deal', 'today only',
+    ],
+    auto_fail_rules: [
+      { pattern: 'unauthorized dealer|salvage title hidden|flood damage hidden', penalty: 3.0, reason: 'Fraudulent dealer/vehicle' },
+      { pattern: 'bait.and.switch|advertised.{0,20}not available', penalty: 2.0, reason: 'Deceptive advertising' },
+    ],
+    evidence_priority: ['official_oem', 'authorized_dealer', 'epa_verified', 'nhtsa_safety'],
+    default_pillar_scores: { authenticity: 4, transparency: 4, value_integrity: 4, support_integrity: 4 },
+  },
+
+  business_guru: {
+    pillars: ['claims_evidence', 'authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      claims_evidence: 0.30,
+      authenticity: 0.30,
+      transparency: 0.20,
+      value_integrity: 0.10,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'made $X in Y days', 'limited spots', 'price going up', 'secret method',
+      'countdown timer', 'fake scarcity', 'quit your job', 'passive income',
+      'financial freedom', 'work from anywhere', 'be your own boss', 'proven system',
+      'copy my exact', 'step-by-step blueprint', 'done for you',
+    ],
+    auto_fail_rules: [
+      { pattern: 'guaranteed income|guaranteed.{0,20}\\$\\d+', penalty: 2.5, reason: 'Income guarantee is illegal' },
+      { pattern: 'get rich quick|overnight millionaire', penalty: 2.0, reason: 'Unrealistic wealth promise' },
+      { pattern: 'mlm|network marketing|downline', penalty: 1.5, reason: 'MLM structure detected' },
+    ],
+    evidence_priority: ['verifiable_credentials', 'named_testimonials', 'public_track_record', 'refund_policy'],
+    default_pillar_scores: { claims_evidence: 7, authenticity: 6, transparency: 6, value_integrity: 7, support_integrity: 6 },
+  },
+
+  health_device: {
+    pillars: ['claims_evidence', 'safety_compliance', 'authenticity', 'transparency', 'value_integrity'],
+    weights: {
+      claims_evidence: 0.35,
+      safety_compliance: 0.30,
+      authenticity: 0.15,
+      transparency: 0.10,
+      value_integrity: 0.10,
+    },
+    red_flags: [
+      'FDA cleared' /* often misused */, 'clinically proven', 'doctor approved',
+      'hospital grade', 'medical breakthrough', 'replaces medication',
+    ],
+    auto_fail_rules: [
+      { pattern: 'cures|treats|diagnoses disease', penalty: 3.0, reason: 'Illegal medical device claim' },
+      { pattern: 'FDA approved.{0,20}device', penalty: 1.0, reason: 'FDA clears, not approves, most devices' },
+    ],
+    evidence_priority: ['peer_reviewed', 'clinical_trial', 'third_party_test', 'manufacturer_study'],
+    default_pillar_scores: { claims_evidence: 7, safety_compliance: 6, authenticity: 5, transparency: 5, value_integrity: 5 },
+  },
+
+  food_beverage: {
+    pillars: ['claims_evidence', 'safety_compliance', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      claims_evidence: 0.25,
+      safety_compliance: 0.25,
+      transparency: 0.25,
+      value_integrity: 0.15,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'superfood', 'detox', 'cleanse', 'burns fat', 'boosts metabolism',
+      'all natural', 'chemical free', 'non-GMO' /* often meaningless */,
+    ],
+    auto_fail_rules: [
+      { pattern: 'cures|treats|prevents disease', penalty: 2.5, reason: 'Illegal health claim for food' },
+    ],
+    evidence_priority: ['peer_reviewed', 'clinical_trial', 'third_party_test', 'ingredient_studies'],
+    default_pillar_scores: { claims_evidence: 5, safety_compliance: 4, transparency: 5, value_integrity: 5, support_integrity: 5 },
+  },
+
+  real_estate: {
+    pillars: ['authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      authenticity: 0.40,
+      transparency: 0.30,
+      value_integrity: 0.20,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'guaranteed appreciation', 'can\'t lose', 'below market', 'motivated seller',
+      'won\'t last', 'multiple offers', 'best and final',
+    ],
+    auto_fail_rules: [
+      { pattern: 'guaranteed.{0,20}return|guaranteed.{0,20}appreciation', penalty: 2.0, reason: 'No real estate returns are guaranteed' },
+    ],
+    evidence_priority: ['licensed', 'public_track_record'],
+    default_pillar_scores: { authenticity: 4, transparency: 4, value_integrity: 5, support_integrity: 5 },
+  },
+
+  financial: {
+    pillars: ['claims_evidence', 'authenticity', 'safety_compliance', 'transparency', 'value_integrity'],
+    weights: {
+      claims_evidence: 0.25,
+      authenticity: 0.30,
+      safety_compliance: 0.25,
+      transparency: 0.15,
+      value_integrity: 0.05,
+    },
+    red_flags: [
+      'guaranteed returns', 'risk-free', 'insider information', 'secret strategy',
+      'beat the market', 'passive income', 'financial freedom',
+    ],
+    auto_fail_rules: [
+      { pattern: 'guaranteed.{0,20}return|guaranteed.{0,20}profit', penalty: 3.0, reason: 'Guaranteed returns are illegal to promise' },
+      { pattern: 'insider.{0,20}information|insider.{0,20}tips', penalty: 2.5, reason: 'Insider trading reference' },
+      { pattern: 'ponzi|pyramid', penalty: 3.0, reason: 'Ponzi/pyramid scheme indicator' },
+    ],
+    evidence_priority: ['sec_registered', 'finra_member', 'licensed', 'public_track_record'],
+    default_pillar_scores: { claims_evidence: 6, authenticity: 5, safety_compliance: 5, transparency: 5, value_integrity: 5 },
+  },
+
+  education: {
+    pillars: ['claims_evidence', 'authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      claims_evidence: 0.25,
+      authenticity: 0.30,
+      transparency: 0.20,
+      value_integrity: 0.15,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'guaranteed job', 'six figure salary', 'in just X weeks', 'no experience needed',
+      'industry secrets', 'limited enrollment',
+    ],
+    auto_fail_rules: [
+      { pattern: 'guaranteed.{0,20}job|guaranteed.{0,20}employment', penalty: 2.0, reason: 'Job guarantees are deceptive' },
+    ],
+    evidence_priority: ['accredited', 'licensed', 'public_track_record', 'verifiable_credentials'],
+    default_pillar_scores: { claims_evidence: 5, authenticity: 5, transparency: 5, value_integrity: 5, support_integrity: 5 },
+  },
+
+  travel: {
+    pillars: ['authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      authenticity: 0.35,
+      transparency: 0.30,
+      value_integrity: 0.25,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'too good to be true', 'limited time', 'book now', 'prices going up',
+      'exclusive deal', 'members only', 'hidden fees',
+    ],
+    auto_fail_rules: [
+      { pattern: 'free vacation|free trip', penalty: 1.5, reason: 'Free vacation scam indicator' },
+    ],
+    evidence_priority: ['official_oem', 'licensed', 'public_track_record'],
+    default_pillar_scores: { authenticity: 4, transparency: 4, value_integrity: 5, support_integrity: 5 },
+  },
+
+  tech: {
+    pillars: ['claims_evidence', 'authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      claims_evidence: 0.20,
+      authenticity: 0.30,
+      transparency: 0.25,
+      value_integrity: 0.15,
+      support_integrity: 0.10,
+    },
+    red_flags: [
+      'revolutionary', 'game-changer', 'disruptive', '10x better', 'kills the competition',
+      'limited stock', 'selling out fast',
+    ],
+    auto_fail_rules: [
+      { pattern: 'fake|counterfeit|knockoff', penalty: 3.0, reason: 'Counterfeit product' },
+    ],
+    evidence_priority: ['third_party_test', 'peer_reviewed', 'public_track_record'],
+    default_pillar_scores: { claims_evidence: 5, authenticity: 5, transparency: 5, value_integrity: 5, support_integrity: 5 },
+  },
+
+  service: {
+    pillars: ['authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      authenticity: 0.35,
+      transparency: 0.30,
+      value_integrity: 0.20,
+      support_integrity: 0.15,
+    },
+    red_flags: [
+      'limited time offer', 'act now', 'special deal', 'won\'t last',
+      'hidden fees', 'cancel anytime' /* often not true */,
+    ],
+    auto_fail_rules: [
+      { pattern: 'scam|fraud', penalty: 3.0, reason: 'Scam/fraud indicator' },
+    ],
+    evidence_priority: ['licensed', 'public_track_record', 'refund_policy'],
+    default_pillar_scores: { authenticity: 5, transparency: 5, value_integrity: 5, support_integrity: 5 },
+  },
+
+  unknown: {
+    pillars: ['claims_evidence', 'authenticity', 'transparency', 'value_integrity', 'support_integrity'],
+    weights: {
+      claims_evidence: 0.25,
+      authenticity: 0.25,
+      transparency: 0.20,
+      value_integrity: 0.15,
+      support_integrity: 0.15,
+    },
+    red_flags: [
+      'limited time', 'act now', 'guaranteed', 'miracle', 'secret',
+    ],
+    auto_fail_rules: [],
+    evidence_priority: ['peer_reviewed', 'third_party_test', 'public_track_record'],
+    default_pillar_scores: { claims_evidence: 6, authenticity: 5, transparency: 5, value_integrity: 5, support_integrity: 5 },
+  },
+};
+
+// =============================================================================
+// PACK SYSTEM - Pillar Evaluation Functions
+// =============================================================================
+
+// Pillar-specific evidence extraction patterns
+const PILLAR_EVIDENCE_PATTERNS: Record<Pillar, { positive: RegExp[]; negative: RegExp[] }> = {
+  claims_evidence: {
+    positive: [
+      /(\d+)\s*(?:participants?|subjects?|people|patients?)/i,
+      /randomized controlled trial|rct|double.blind/i,
+      /peer.reviewed|published in|journal/i,
+      /clinical (?:study|trial|evidence)/i,
+      /evidence supports|research confirms|study shows/i,
+      /independently verified|third.party tested/i,
+    ],
+    negative: [
+      /no.{0,20}(?:clinical|scientific).{0,20}(?:studies|evidence|trials)/i,
+      /only testimonials|anecdotal/i,
+      /unsubstantiated|not proven|no evidence/i,
+      /pseudoscience|debunked|false claim/i,
+    ],
+  },
+  safety_compliance: {
+    positive: [
+      /fda registered|fda cleared/i,
+      /gmp certified|good manufacturing practice/i,
+      /nsf certified|usp verified/i,
+      /third.party tested for purity/i,
+      /certificate of analysis|coa/i,
+      /safe for|safety tested/i,
+    ],
+    negative: [
+      /fda warning|fda action/i,
+      /recalled|contaminated/i,
+      /side effects reported|adverse reactions/i,
+      /not evaluated by fda/i,
+      /banned ingredient|prohibited substance/i,
+    ],
+  },
+  authenticity: {
+    positive: [
+      /official|oem|manufacturer/i,
+      /authorized dealer|authorized reseller/i,
+      /verified seller|verified business/i,
+      /established.{0,20}(?:company|brand|business)/i,
+      /registered trademark|official website/i,
+    ],
+    negative: [
+      /fake|counterfeit|knockoff/i,
+      /unauthorized|grey market/i,
+      /scam|fraud/i,
+      /no business registration|unregistered/i,
+      /misleading|deceptive/i,
+    ],
+  },
+  transparency: {
+    positive: [
+      /full ingredient list|all ingredients disclosed/i,
+      /transparent pricing|clear pricing/i,
+      /terms clearly stated|clear terms/i,
+      /easy to find contact|contact information provided/i,
+      /return policy clearly stated/i,
+    ],
+    negative: [
+      /proprietary blend|undisclosed/i,
+      /hidden fees|surprise charges/i,
+      /fine print|buried in terms/i,
+      /hard to find contact|no contact info/i,
+      /vague|unclear/i,
+    ],
+  },
+  value_integrity: {
+    positive: [
+      /fair price|reasonable price|good value/i,
+      /competitive pricing|market rate/i,
+      /msrp|transparent pricing/i,
+      /money.back guarantee/i,
+      /no hidden fees|all.inclusive/i,
+    ],
+    negative: [
+      /overpriced|expensive|markup/i,
+      /hidden fees|additional charges/i,
+      /auto.?ship|forced subscription/i,
+      /price gouging|inflated/i,
+      /bait.and.switch/i,
+    ],
+  },
+  support_integrity: {
+    positive: [
+      /easy to cancel|cancel anytime/i,
+      /responsive customer service|quick response/i,
+      /clear return policy|30.day guarantee/i,
+      /refund.{0,20}easy|hassle.free return/i,
+      /customer support available/i,
+    ],
+    negative: [
+      /hard to cancel|cancellation difficult/i,
+      /no response|unresponsive/i,
+      /no refund|non.refundable/i,
+      /customer complaints|bbb complaints/i,
+      /support issues|poor support/i,
+    ],
+  },
+};
+
+// Evaluate a single pillar based on text evidence
+function evaluatePillar(
+  pillar: Pillar,
+  text: string,
+  evidencePriority: EvidenceType[]
+): { score: number; evidence: string[]; confidence: number } {
+  const lower = text.toLowerCase();
+  const patterns = PILLAR_EVIDENCE_PATTERNS[pillar];
+  const evidence: string[] = [];
+  let positiveHits = 0;
+  let negativeHits = 0;
+
+  // Check positive patterns
+  for (const pattern of patterns.positive) {
+    if (pattern.test(lower)) {
+      positiveHits++;
+      const match = lower.match(pattern);
+      if (match) {
+        evidence.push(`✓ ${match[0].substring(0, 80)}`);
+      }
+    }
+  }
+
+  // Check negative patterns
+  for (const pattern of patterns.negative) {
+    if (pattern.test(lower)) {
+      negativeHits++;
+      const match = lower.match(pattern);
+      if (match) {
+        evidence.push(`✗ ${match[0].substring(0, 80)}`);
+      }
+    }
+  }
+
+  // Special handling for claims_evidence - check study size
+  if (pillar === 'claims_evidence') {
+    const studyMatch = text.match(/(\d+)\s*(?:participants?|subjects?|people|patients?)/i);
+    if (studyMatch) {
+      const participants = parseInt(studyMatch[1]);
+      if (participants >= 200) positiveHits += 3;
+      else if (participants >= 50) positiveHits += 2;
+      else if (participants >= 10) positiveHits += 1;
+      evidence.push(`Study size: ${participants} participants`);
+    }
+  }
+
+  // Calculate score (lower is better, 0-10 scale)
+  // More positive evidence = lower score (less BS)
+  // More negative evidence = higher score (more BS)
+  let score: number;
+  const totalHits = positiveHits + negativeHits;
+
+  if (totalHits === 0) {
+    // No evidence found - use default (moderate concern)
+    score = 6;
+  } else {
+    const ratio = positiveHits / (positiveHits + negativeHits + 0.1);
+    // ratio of 1.0 = all positive = score of 2
+    // ratio of 0.5 = mixed = score of 5
+    // ratio of 0.0 = all negative = score of 9
+    score = 9 - (ratio * 7);
+  }
+
+  // Confidence is based on how much evidence we found
+  const confidence = Math.min(1, totalHits / 3);
+
+  return {
+    score: roundToHalf(Math.max(0, Math.min(10, score))),
+    evidence: evidence.slice(0, 5),
+    confidence,
+  };
+}
+
+// Find red flags from pack configuration in text
+function findRedFlagsFromPack(text: string, pack: CategoryPack): string[] {
+  const lower = text.toLowerCase();
+  const foundFlags: string[] = [];
+
+  for (const flag of pack.red_flags) {
+    const flagLower = flag.toLowerCase();
+    // Check if the red flag phrase appears in text
+    if (lower.includes(flagLower)) {
+      foundFlags.push(`Uses "${flag}" language`);
+    }
+  }
+
+  return foundFlags.slice(0, 5);
+}
+
+// Check auto-fail rules and return penalties
+function checkAutoFails(text: string, pack: CategoryPack): { totalPenalty: number; triggeredRules: string[] } {
+  const lower = text.toLowerCase();
+  let totalPenalty = 0;
+  const triggeredRules: string[] = [];
+
+  for (const rule of pack.auto_fail_rules) {
+    const pattern = new RegExp(rule.pattern, 'i');
+    if (pattern.test(lower)) {
+      totalPenalty += rule.penalty;
+      triggeredRules.push(rule.reason);
+    }
+  }
+
+  return { totalPenalty, triggeredRules };
+}
+
+// Compute confidence from pillar evaluations and evidence count
+function computeConfidence(
+  pillarResults: Record<Pillar, { score: number; evidence: string[]; confidence: number }>,
+  citations: string[],
+  evidenceBullets: string[]
+): number {
+  // Base confidence from pillar evidence
+  const pillarConfidences = Object.values(pillarResults).map(r => r.confidence);
+  const avgPillarConfidence = pillarConfidences.length > 0
+    ? pillarConfidences.reduce((a, b) => a + b, 0) / pillarConfidences.length
+    : 0.5;
+
+  // Citation boost
+  let citationBoost = 0;
+  if (citations.length >= 5) citationBoost = 0.15;
+  else if (citations.length >= 2) citationBoost = 0.1;
+  else if (citations.length >= 1) citationBoost = 0.05;
+
+  // Evidence bullet boost
+  let evidenceBoost = 0;
+  if (evidenceBullets.length >= 7) evidenceBoost = 0.1;
+  else if (evidenceBullets.length >= 5) evidenceBoost = 0.05;
+
+  const confidence = Math.min(1, avgPillarConfidence * 0.6 + citationBoost + evidenceBoost + 0.2);
+  return Math.round(confidence * 100) / 100;
+}
+
+// Main pack-based scoring function
+function scoreWithPack(
+  category: ProductCategory,
+  perplexityResponse: string,
+  pageContent: string = '',
+  citations: string[] = []
+): {
+  bunkScore: number;
+  pillarScores: Partial<Record<Pillar, number>>;
+  confidence: number;
+  redFlags: string[];
+  autoFailReasons: string[];
+  verdict: 'low' | 'elevated' | 'high';
+  unableToScore: boolean;
+  insufficientReason?: string;
+} {
+  const pack = CATEGORY_PACKS[category] || CATEGORY_PACKS.unknown;
+  const combinedText = `${perplexityResponse}\n${pageContent}`;
+
+  // Evaluate each pillar
+  const pillarResults: Partial<Record<Pillar, { score: number; evidence: string[]; confidence: number }>> = {};
+  const pillarScores: Partial<Record<Pillar, number>> = {};
+
+  for (const pillar of pack.pillars) {
+    const result = evaluatePillar(pillar, combinedText, pack.evidence_priority);
+    pillarResults[pillar] = result;
+    pillarScores[pillar] = result.score;
+  }
+
+  // Check auto-fail rules
+  const { totalPenalty, triggeredRules } = checkAutoFails(combinedText, pack);
+
+  // Find red flags from pack
+  const packRedFlags = findRedFlagsFromPack(combinedText, pack);
+
+  // Also extract general red flags
+  const generalRedFlags = extractRedFlags(perplexityResponse);
+  const allRedFlags = [...new Set([...packRedFlags, ...generalRedFlags])].slice(0, 8);
+
+  // Add auto-fail reasons to red flags
+  if (triggeredRules.length > 0) {
+    allRedFlags.unshift(...triggeredRules.map(r => `⚠️ ${r}`));
+  }
+
+  // Compute weighted score
+  let weightedSum = 0;
+  let totalWeight = 0;
+
+  for (const pillar of pack.pillars) {
+    const weight = pack.weights[pillar] || 0;
+    const score = pillarScores[pillar] ?? (pack.default_pillar_scores?.[pillar] ?? 5);
+    weightedSum += score * weight;
+    totalWeight += weight;
+  }
+
+  let baseScore = totalWeight > 0 ? weightedSum / totalWeight : 5;
+
+  // Apply auto-fail penalty
+  baseScore = Math.min(10, baseScore + totalPenalty);
+
+  const bunkScore = roundToHalf(baseScore);
+
+  // Compute confidence
+  const confidence = computeConfidence(
+    pillarResults as Record<Pillar, { score: number; evidence: string[]; confidence: number }>,
+    citations,
+    extractEvidenceBullets(perplexityResponse)
+  );
+
+  // Determine if we can score based on confidence
+  const unableToScore = confidence < 0.5;
+  const insufficientReason = unableToScore
+    ? `Confidence too low (${(confidence * 100).toFixed(0)}%) - insufficient evidence to provide a reliable score`
+    : undefined;
+
+  // Compute verdict
+  const verdict = verdictFromScore(bunkScore);
+
+  return {
+    bunkScore: unableToScore ? 0 : bunkScore,
+    pillarScores,
+    confidence,
+    redFlags: allRedFlags,
+    autoFailReasons: triggeredRules,
+    verdict: unableToScore ? 'elevated' : verdict,
+    unableToScore,
+    insufficientReason,
+  };
+}
+
+// Legacy weights (for backward compatibility during transition)
+const CATEGORY_WEIGHTS: Record<ProductCategory, { he: number; at: number; mo: number; pv: number }> = {
+  supplement:     { he: 0.40, at: 0.25, mo: 0.25, pv: 0.10 },
+  beauty:         { he: 0.35, at: 0.25, mo: 0.25, pv: 0.15 },
+  health_device:  { he: 0.40, at: 0.30, mo: 0.20, pv: 0.10 },
+  food_beverage:  { he: 0.30, at: 0.30, mo: 0.25, pv: 0.15 },
+  automotive:     { he: 0.00, at: 0.40, mo: 0.30, pv: 0.30 },
+  real_estate:    { he: 0.00, at: 0.45, mo: 0.30, pv: 0.25 },
+  financial:      { he: 0.10, at: 0.40, mo: 0.35, pv: 0.15 },
+  education:      { he: 0.15, at: 0.35, mo: 0.35, pv: 0.15 },
+  travel:         { he: 0.00, at: 0.40, mo: 0.30, pv: 0.30 },
+  business_guru:  { he: 0.30, at: 0.30, mo: 0.30, pv: 0.10 },
+  tech:           { he: 0.10, at: 0.35, mo: 0.35, pv: 0.20 },
+  service:        { he: 0.10, at: 0.40, mo: 0.30, pv: 0.20 },
+  unknown:        { he: 0.25, at: 0.30, mo: 0.30, pv: 0.15 },
+};
+
+// Build Phase 1 request - research prompt with optional page content
+export function buildPhase1Request(input: {
+  input_type: "url" | "text" | "image";
+  input_value: string;
+  normalized_input?: string;
+  pageContent?: string; // Fetched page content for URL inputs
+}): object {
+  const normalizedInput = input.normalized_input || input.input_value;
+  const hasPageContent = input.pageContent && input.pageContent.length > 100;
+
+  // System message varies based on whether we have page content
+  let systemMessage: string;
+
+  if (hasPageContent) {
+    // Constrained mode: We have the actual page content
+    systemMessage = `You are a thorough product/claims researcher. Your job is to investigate products and marketing claims to help consumers make informed decisions.
+
+IMPORTANT RULES:
+1. For PRODUCT DETAILS (price, volume, ingredients, product name), use ONLY the page content provided below. Do NOT use external sources for these facts.
+2. For CLAIM VERIFICATION (clinical studies, independent reviews, expert opinions, red flags), you SHOULD use external sources to verify or debunk claims.
+3. If the page content shows a price like "$79", report "$79" - do not substitute prices from other sources.
+
+When analyzing:
+- Extract product details ONLY from the provided page content
+- Research external sources to verify/debunk the CLAIMS made on the page
+- Look for clinical studies, their sample sizes, and results
+- Find independent reviews and expert opinions
+- Identify any red flags or misleading tactics
+- Give an honest, balanced assessment`;
+  } else {
+    // Unconstrained mode: No page content, let Perplexity research freely
+    systemMessage = `You are a thorough product/claims researcher. Your job is to investigate products and marketing claims to help consumers make informed decisions.
+
+When analyzing, research and report on:
+1. What claims does this product/person make?
+2. What evidence supports or contradicts these claims? (clinical studies, reviews, expert opinions)
+3. Who is behind this product? Are they credible?
+4. What do independent sources say? (not just the company's website)
+5. Are there any red flags? (fake reviews, misleading claims, regulatory issues)
+6. How does pricing compare to similar products?
+
+Be specific. Cite your sources. If you find clinical studies, mention the sample size and results. If you find negative reviews or complaints, include them. Don't hold back—give an honest, balanced assessment.`;
+  }
+
+  let userMessage: string;
+
+  if (input.input_type === 'url' && hasPageContent) {
+    // URL with fetched page content - constrained analysis
+    userMessage = `Analyze this product page for BS.
+
+SOURCE URL: ${normalizedInput}
+
+=== PAGE CONTENT (use this for product details) ===
+${input.pageContent}
+=== END PAGE CONTENT ===
+
+Based on the page content above:
+1. What product is being sold? (name, price, volume - from page content ONLY)
+2. What claims does it make? (extract from page content)
+3. Are these claims supported by evidence? (research external sources to verify)
+4. Any red flags or concerns? (check for fake reviews, misleading tactics, etc.)
+5. Your overall verdict: is this legit or BS?
+
+Remember: Product details (price, size, ingredients) must come from the page content above. Use external research only to verify the CLAIMS.`;
+  } else if (input.input_type === 'url') {
+    // URL without page content - fallback to unconstrained
+    userMessage = `Research this product/page and give me a thorough BS analysis: ${normalizedInput}
+
+Tell me:
+- What is being sold and what claims are made?
+- Is there real evidence (studies, trials, verified results)?
+- Any red flags or concerns?
+- Your overall verdict: is this legit or BS?`;
+  } else if (input.input_type === 'text') {
+    userMessage = `Analyze these product claims for BS:
+
+${normalizedInput}
+
+Research whether these claims are supported by evidence. Look for:
+- Scientific studies or clinical trials
+- Independent reviews or expert opinions
+- Red flags or misleading tactics
+- Your overall verdict on legitimacy`;
+  } else {
+    userMessage = `Research and analyze: ${normalizedInput}`;
+  }
+
+  return {
+    model: "sonar-pro",
+    messages: [
+      { role: "system", content: systemMessage },
+      { role: "user", content: userMessage },
+    ],
+    temperature: 0.2,
+    max_tokens: 2000, // More room since we're including page content
+  };
+}
+
+// =============================================================================
+// PHASE 2: Extraction Phase - Parse Perplexity's response into our structure
+// =============================================================================
+
+// Detect product category from Perplexity's response and URL
+function detectProductCategory(text: string, url?: string): ProductCategory {
+  const lower = text.toLowerCase();
+  const urlLower = (url || '').toLowerCase();
+
+  // Category keyword definitions
+  const categoryKeywords: Record<ProductCategory, string[]> = {
+    // Health/wellness categories
+    supplement: ['supplement', 'vitamin', 'capsule', 'pill', 'mg', 'dosage',
+      'dietary', 'probiotic', 'protein powder', 'amino acid', 'herbal', 'extract',
+      'fda disclaimer', 'not intended to diagnose'],
+
+    beauty: ['serum', 'cream', 'skincare', 'anti-aging', 'wrinkle',
+      'moisturizer', 'collagen', 'retinol', 'hyaluronic', 'beauty', 'cosmetic',
+      'dermatologist', 'skin care', 'facial', 'lash', 'mascara'],
+
+    health_device: ['medical device', 'fda cleared', 'therapeutic',
+      'pain relief', 'therapy device', 'wearable health', 'blood pressure',
+      'glucose monitor'],
+
+    food_beverage: ['drink', 'beverage', 'food', 'organic', 'non-gmo',
+      'nutrition facts', 'calories', 'ingredients list', 'snack', 'meal'],
+
+    // Automotive - HIGH PRIORITY for OEM sites
+    automotive: ['vehicle', 'car', 'truck', 'suv', 'sedan', 'mpg', 'horsepower',
+      'engine', 'transmission', 'dealership', 'msrp', 'lease', 'financing',
+      'test drive', 'manufacturer', 'oem', 'automotive', 'motor', 'nissan',
+      'toyota', 'honda', 'ford', 'chevrolet', 'bmw', 'mercedes', 'audi',
+      'volkswagen', 'hyundai', 'kia', 'mazda', 'subaru', 'lexus', 'acura'],
+
+    // Real estate
+    real_estate: ['property', 'real estate', 'home for sale', 'mortgage',
+      'listing', 'mls', 'square feet', 'bedrooms', 'bathrooms', 'realtor',
+      'broker', 'open house', 'closing cost', 'down payment', 'zillow', 'redfin'],
+
+    // Financial services
+    financial: ['investment', 'stock', 'bond', 'mutual fund', 'etf', 'ira',
+      '401k', 'retirement', 'portfolio', 'dividend', 'interest rate', 'apr',
+      'credit card', 'loan', 'bank', 'insurance', 'premium', 'deductible',
+      'brokerage', 'financial advisor'],
+
+    // Education
+    education: ['course', 'university', 'college', 'degree', 'certificate',
+      'online learning', 'tuition', 'enrollment', 'curriculum', 'accredited',
+      'bootcamp', 'training program', 'certification'],
+
+    // Travel
+    travel: ['hotel', 'flight', 'booking', 'reservation', 'vacation', 'resort',
+      'airline', 'cruise', 'travel', 'destination', 'itinerary', 'check-in',
+      'airbnb', 'expedia', 'tripadvisor'],
+
+    // Business guru (separate from education)
+    business_guru: ['masterclass', 'coaching', 'mentor', 'entrepreneur',
+      'make money', 'passive income', 'millionaire', 'success secrets', 'wealth',
+      'trading secrets', 'crypto', 'forex', 'dropshipping', 'affiliate marketing',
+      'get rich', 'financial freedom', 'side hustle'],
+
+    // Tech
+    tech: ['gadget', 'app', 'software', 'charger', 'wireless', 'bluetooth',
+      'smart home', 'electronic', 'battery', 'specs', 'warranty', 'tech',
+      'computer', 'laptop', 'phone', 'tablet'],
+
+    // Generic service
+    service: ['service', 'subscription', 'membership', 'plan', 'tier'],
+
+    unknown: [],
+  };
+
+  // Count matches for each category
+  const scores: Record<ProductCategory, number> = {
+    supplement: 0, beauty: 0, tech: 0, business_guru: 0, health_device: 0,
+    food_beverage: 0, automotive: 0, real_estate: 0, financial: 0,
+    education: 0, travel: 0, service: 0, unknown: 0,
+  };
+
+  // Check text content
+  for (const [category, keywords] of Object.entries(categoryKeywords)) {
+    for (const kw of keywords) {
+      if (lower.includes(kw)) scores[category as ProductCategory]++;
+    }
+  }
+
+  // URL-based boosts (strong signals)
+  if (/nissan|toyota|honda|ford|chevrolet|bmw|mercedes|audi|volkswagen|hyundai|kia|mazda|subaru|lexus|acura|dodge|jeep|ram|gmc|cadillac|buick|lincoln|infiniti|genesis|volvo|porsche|tesla/i.test(urlLower)) {
+    scores.automotive += 10; // Strong boost for OEM domains
+  }
+  if (/zillow|redfin|realtor|trulia|homes\.com/i.test(urlLower)) {
+    scores.real_estate += 10;
+  }
+  if (/fidelity|vanguard|schwab|etrade|robinhood|ameritrade/i.test(urlLower)) {
+    scores.financial += 10;
+  }
+  if (/expedia|booking\.com|airbnb|tripadvisor|hotels\.com|kayak/i.test(urlLower)) {
+    scores.travel += 10;
+  }
+  if (/coursera|udemy|edx|skillshare|linkedin\.com\/learning/i.test(urlLower)) {
+    scores.education += 10;
+  }
+
+  // Find highest scoring category
+  let maxCategory: ProductCategory = 'unknown';
+  let maxScore = 0;
+  for (const [cat, score] of Object.entries(scores)) {
+    if (score > maxScore) {
+      maxScore = score;
+      maxCategory = cat as ProductCategory;
+    }
+  }
+
+  return maxScore >= 2 ? maxCategory : 'unknown';
+}
+
+// Extract claims from natural text
+function extractClaims(text: string): Array<{ claim: string; support_level: string; why: string }> {
+  const claims: Array<{ claim: string; support_level: string; why: string }> = [];
+  const lines = text.split(/[.\n]/).map(l => l.trim()).filter(l => l.length > 20);
+
+  // Patterns that indicate claims
+  const claimPatterns = [
+    /claims?\s+(?:that|to)\s+(.+)/i,
+    /promises?\s+(.+)/i,
+    /states?\s+(?:that\s+)?(.+)/i,
+    /alleges?\s+(.+)/i,
+    /suggests?\s+(?:that\s+)?(.+)/i,
+  ];
+
+  // Support level indicators
+  const supportedIndicators = ['study shows', 'research confirms', 'evidence supports', 'clinically proven', 'verified', 'documented'];
+  const mixedIndicators = ['some evidence', 'limited studies', 'mixed results', 'partially supported'];
+  const weakIndicators = ['no evidence', 'unsubstantiated', 'not proven', 'questionable', 'dubious'];
+  const unsupportedIndicators = ['false', 'misleading', 'debunked', 'no scientific basis', 'pseudoscience'];
+
+  for (const line of lines) {
+    for (const pattern of claimPatterns) {
+      const match = line.match(pattern);
+      if (match && match[1]) {
+        const claimText = match[1].substring(0, 150);
+
+        // Determine support level from surrounding context
+        const context = line.toLowerCase();
+        let support_level = 'mixed';
+        let why = 'Based on available evidence';
+
+        if (unsupportedIndicators.some(ind => context.includes(ind))) {
+          support_level = 'unsupported';
+          why = 'No credible evidence found';
+        } else if (weakIndicators.some(ind => context.includes(ind))) {
+          support_level = 'weak';
+          why = 'Insufficient evidence to support claim';
+        } else if (supportedIndicators.some(ind => context.includes(ind))) {
+          support_level = 'supported';
+          why = 'Evidence found to support claim';
+        } else if (mixedIndicators.some(ind => context.includes(ind))) {
+          support_level = 'mixed';
+          why = 'Some evidence exists but results vary';
+        }
+
+        claims.push({ claim: claimText, support_level, why });
+        break;
+      }
+    }
+  }
+
+  // If we didn't find enough claims via patterns, extract key statements
+  if (claims.length < 3) {
+    const keyPhrases = text.match(/(?:the product|this product|it|they)\s+(?:claims?|promises?|offers?|provides?)\s+[^.]+/gi) || [];
+    for (const phrase of keyPhrases.slice(0, 5)) {
+      if (!claims.some(c => c.claim.includes(phrase.substring(0, 30)))) {
+        claims.push({
+          claim: phrase.substring(0, 150),
+          support_level: 'mixed',
+          why: 'Extracted from product description'
+        });
+      }
+    }
+  }
+
+  return claims.slice(0, 8);
+}
+
+// Extract red flags from natural text
+function extractRedFlags(text: string): string[] {
+  const flags: string[] = [];
+  const lower = text.toLowerCase();
+
+  // Direct red flag mentions
+  const redFlagPatterns = [
+    /red flags?:?\s*([^.]+)/gi,
+    /concerns?:?\s*([^.]+)/gi,
+    /warning:?\s*([^.]+)/gi,
+    /problematic[^.]+/gi,
+    /suspicious[^.]+/gi,
+    /misleading[^.]+/gi,
+  ];
+
+  for (const pattern of redFlagPatterns) {
+    const matches = text.matchAll(pattern);
+    for (const match of matches) {
+      const flag = (match[1] || match[0]).trim();
+      if (flag.length > 10 && flag.length < 200 && !flags.includes(flag)) {
+        flags.push(flag);
+      }
+    }
+  }
+
+  // NOTE: We removed aggressive keyword-based pattern matching here.
+  // Previously, patterns like /fake reviews?/i would match ANY mention of these
+  // words, even in negative context like "no evidence of fake reviews".
+  // Now we only rely on explicit red flag mentions extracted above via the
+  // redFlagPatterns (which look for "red flag:", "warning:", etc.)
+  // This prevents false positives for legitimate products.
+
+  return flags.slice(0, 8);
+}
+
+// Extract evidence bullets from natural text
+function extractEvidenceBullets(text: string): string[] {
+  const bullets: string[] = [];
+
+  // Look for study mentions
+  const studyPattern = /(?:study|trial|research|investigation)[^.]*(?:\d+\s*(?:participants?|subjects?|people|patients?))[^.]*/gi;
+  const studyMatches = text.matchAll(studyPattern);
+  for (const match of studyMatches) {
+    bullets.push(match[0].trim());
+  }
+
+  // Look for specific findings
+  const findingPatterns = [
+    /found that[^.]+/gi,
+    /results showed[^.]+/gi,
+    /evidence suggests[^.]+/gi,
+    /according to[^.]+/gi,
+    /research indicates[^.]+/gi,
+  ];
+
+  for (const pattern of findingPatterns) {
+    const matches = text.matchAll(pattern);
+    for (const match of matches) {
+      const bullet = match[0].trim();
+      if (bullet.length > 20 && bullet.length < 200 && !bullets.includes(bullet)) {
+        bullets.push(bullet);
+      }
+    }
+  }
+
+  // Look for bullet-like statements in the original text
+  const bulletLines = text.split('\n').filter(line =>
+    line.trim().startsWith('-') ||
+    line.trim().startsWith('•') ||
+    line.trim().match(/^\d+\./)
+  );
+  for (const line of bulletLines) {
+    const cleaned = line.replace(/^[-•\d.]+\s*/, '').trim();
+    if (cleaned.length > 20 && cleaned.length < 200 && !bullets.includes(cleaned)) {
+      bullets.push(cleaned);
+    }
+  }
+
+  return bullets.slice(0, 10);
+}
+
+// Compute subscores based on extracted data and category
+function computeSubscoresFromExtraction(
+  text: string,
+  category: ProductCategory,
+  claims: Array<{ claim: string; support_level: string; why: string }>,
+  redFlags: string[],
+  evidenceBullets: string[]
+): { human_evidence: number; authenticity_transparency: number; marketing_overclaim: number; pricing_value: number } {
+  const lower = text.toLowerCase();
+
+  // Get category-specific weight (to determine if a dimension matters)
+  const weights = CATEGORY_WEIGHTS[category];
+
+  // ==========================================================================
+  // HUMAN EVIDENCE SCORE - Category-specific logic
+  // ==========================================================================
+  let humanEvidence: number;
+
+  if (weights.he === 0) {
+    // Categories where human evidence doesn't apply (automotive, travel, real_estate)
+    humanEvidence = 5; // Neutral - won't affect final score anyway
+  } else if (['supplement', 'beauty', 'health_device', 'food_beverage'].includes(category)) {
+    // HEALTH CATEGORIES - clinical studies matter
+    humanEvidence = 7; // Default: no strong evidence
+
+    const studyMatch = text.match(/(\d+)\s*(?:participants?|subjects?|people|patients?)/i);
+    if (studyMatch) {
+      const participants = parseInt(studyMatch[1]);
+      if (participants >= 200) humanEvidence = 2;
+      else if (participants >= 50) humanEvidence = 3.5;
+      else if (participants >= 10) humanEvidence = 5.5;
+      else humanEvidence = 6.5;
+    }
+
+    if (/randomized controlled trial|rct|double.blind/i.test(lower)) humanEvidence = Math.max(1.5, humanEvidence - 1.5);
+    if (/peer.reviewed|published in/i.test(lower)) humanEvidence = Math.max(2, humanEvidence - 1);
+    if (/no.{0,20}(?:clinical|scientific).{0,20}(?:studies|evidence|trials)/i.test(lower)) humanEvidence = Math.min(8.5, humanEvidence + 2);
+    if (/only testimonials|anecdotal/i.test(lower)) humanEvidence = Math.min(8, humanEvidence + 1.5);
+
+  } else if (category === 'business_guru') {
+    // GURU CATEGORY - verifiable credentials/results matter
+    humanEvidence = 6; // Default: moderate skepticism
+
+    if (/verified results|documented success|track record/i.test(lower)) humanEvidence = 3;
+    if (/forbes|inc magazine|legitimate media/i.test(lower)) humanEvidence = Math.max(2.5, humanEvidence - 1.5);
+    if (/no verifiable|fake testimonials|paid actors/i.test(lower)) humanEvidence = 8.5;
+    if (/mlm|pyramid|ponzi/i.test(lower)) humanEvidence = 9.5;
+
+  } else {
+    // OTHER CATEGORIES - light evidence check
+    humanEvidence = 5; // Neutral default
+
+    if (/independent review|consumer reports|expert opinion/i.test(lower)) humanEvidence = 3;
+    if (/fake|fabricated|misleading/i.test(lower)) humanEvidence = 8;
+  }
+
+  // ==========================================================================
+  // AUTHENTICITY/TRANSPARENCY SCORE - Category-specific logic
+  // ==========================================================================
+  let authenticity: number;
+
+  if (['automotive', 'real_estate', 'travel'].includes(category)) {
+    // HIGH-VALUE CATEGORIES - official source verification matters
+    authenticity = 4; // Default: moderate trust for legitimate sites
+
+    // Official/OEM indicators (GOOD)
+    if (/official|oem|manufacturer|authorized dealer/i.test(lower)) authenticity = 2;
+    if (/\.ca$|\.com$|official website/i.test(lower)) authenticity = Math.max(2, authenticity - 1);
+    if (/msrp|transparent pricing|no hidden fees/i.test(lower)) authenticity = Math.max(2.5, authenticity - 1);
+
+    // Red flags for these categories
+    if (/third.party|reseller|unauthorized/i.test(lower)) authenticity = Math.min(7, authenticity + 2);
+    if (/too good to be true|bait.and.switch|hidden fees/i.test(lower)) authenticity = 8;
+    if (/scam|fraud|fake dealer/i.test(lower)) authenticity = 9.5;
+
+  } else if (['supplement', 'beauty', 'health_device'].includes(category)) {
+    // HEALTH CATEGORIES - third-party testing matters
+    authenticity = 6; // Default: moderate concern
+
+    if (/third.party tested|independently verified|coa|certificate of analysis/i.test(lower)) authenticity = 3;
+    if (/gmp certified|fda registered facility|nsf certified/i.test(lower)) authenticity = Math.max(2.5, authenticity - 1.5);
+    if (/transparent|full ingredient list|clearly labeled/i.test(lower)) authenticity = Math.max(3, authenticity - 1);
+    if (/proprietary blend|undisclosed|hidden ingredients/i.test(lower)) authenticity = Math.min(8, authenticity + 2);
+    if (/fake|fraudulent|scam/i.test(lower)) authenticity = 9.5;
+
+  } else if (category === 'financial') {
+    // FINANCIAL CATEGORY - regulatory compliance matters
+    authenticity = 5; // Default
+
+    if (/sec registered|finra|fdic insured|regulated/i.test(lower)) authenticity = 2;
+    if (/licensed|certified financial/i.test(lower)) authenticity = Math.max(3, authenticity - 1);
+    if (/unregistered|unlicensed|offshore/i.test(lower)) authenticity = 8.5;
+    if (/ponzi|fraud|sec enforcement/i.test(lower)) authenticity = 9.5;
+
+  } else {
+    // OTHER CATEGORIES - general transparency
+    authenticity = 5; // Default
+
+    if (/transparent|verified|official/i.test(lower)) authenticity = 3;
+    if (/hidden|undisclosed|fake/i.test(lower)) authenticity = 8;
+    if (/scam|fraud/i.test(lower)) authenticity = 9.5;
+  }
+
+  // ==========================================================================
+  // MARKETING OVERCLAIM SCORE - Mostly universal logic with category adjustments
+  // ==========================================================================
+  let marketingOverclaim = 5; // Default: some marketing hype expected
+
+  // Check claim support levels (universal)
+  const unsupportedCount = claims.filter(c => c.support_level === 'unsupported').length;
+  const weakCount = claims.filter(c => c.support_level === 'weak').length;
+  const supportedCount = claims.filter(c => c.support_level === 'supported').length;
+
+  if (unsupportedCount >= 3) marketingOverclaim = 8.5;
+  else if (unsupportedCount >= 1) marketingOverclaim = 7;
+  else if (weakCount >= 2) marketingOverclaim = 6;
+  else if (supportedCount >= 3) marketingOverclaim = 3;
+
+  // Category-specific overclaim patterns
+  if (['supplement', 'beauty', 'health_device'].includes(category)) {
+    if (/miracle|cure|100% effective/i.test(lower)) marketingOverclaim = Math.min(9, marketingOverclaim + 2);
+    if (/fda approved/i.test(lower) && /supplement|cosmetic/i.test(lower)) marketingOverclaim = Math.min(9, marketingOverclaim + 1.5); // Misleading
+  } else if (category === 'automotive') {
+    if (/best in class|#1|unbeatable/i.test(lower)) marketingOverclaim = Math.min(6, marketingOverclaim + 0.5); // Normal car marketing
+    if (/misleading fuel economy|fake mpg|emissions scandal/i.test(lower)) marketingOverclaim = 8.5;
+  } else if (category === 'business_guru') {
+    if (/guaranteed income|make \$\d+k|quit your job/i.test(lower)) marketingOverclaim = Math.min(9, marketingOverclaim + 2);
+    if (/limited spots|act now|price going up/i.test(lower)) marketingOverclaim = Math.min(8.5, marketingOverclaim + 1);
+  }
+
+  // Universal red flag language
+  if (/miracle|revolutionary|breakthrough/i.test(lower) && !['tech'].includes(category)) {
+    marketingOverclaim = Math.min(9, marketingOverclaim + 1);
+  }
+  if (/modest|may help|supports|typical results/i.test(lower)) marketingOverclaim = Math.max(3, marketingOverclaim - 1);
+
+  // ==========================================================================
+  // PRICING/VALUE SCORE - Category-specific logic
+  // ==========================================================================
+  let pricingValue: number;
+
+  if (['automotive', 'real_estate'].includes(category)) {
+    // HIGH-VALUE PURCHASES - transparency and hidden fees matter
+    pricingValue = 4; // Default: assume transparent for official sites
+
+    if (/msrp|transparent pricing|no hidden fees|all.inclusive/i.test(lower)) pricingValue = 2;
+    if (/dealer markup|market adjustment|hidden fees|destination charge/i.test(lower)) pricingValue = 6;
+    if (/bait.and.switch|advertised price.{0,20}different|fine print/i.test(lower)) pricingValue = 8.5;
+
+  } else if (category === 'business_guru') {
+    // GURU PRICING - often predatory
+    pricingValue = 7; // Default: skeptical
+
+    if (/free|affordable|money.back guarantee/i.test(lower)) pricingValue = 5;
+    if (/upsell|one.time offer|payment plan/i.test(lower)) pricingValue = 8;
+    if (/\$\d{4,}|\$\d+k/i.test(lower)) pricingValue = Math.min(9, pricingValue + 1); // High ticket = more scrutiny
+
+  } else {
+    // OTHER CATEGORIES - general value assessment
+    pricingValue = 5; // Default: moderate
+
+    if (/overpriced|expensive|high markup|not worth/i.test(lower)) pricingValue = 7.5;
+    if (/affordable|good value|reasonably priced|fair price/i.test(lower)) pricingValue = 3;
+    if (/subscription trap|hard to cancel|auto.?ship/i.test(lower)) pricingValue = 8;
+    if (/money.back guarantee|refund policy/i.test(lower) && !/fine print|conditions/i.test(lower)) {
+      pricingValue = Math.max(3, pricingValue - 1);
+    }
+  }
+
+  // ==========================================================================
+  // RED FLAGS PENALTY - Universal but scaled
+  // ==========================================================================
+  const flagPenalty = Math.min(1.5, redFlags.length * 0.25);
+  if (weights.he > 0) humanEvidence = Math.min(10, humanEvidence + flagPenalty * 0.5);
+  authenticity = Math.min(10, authenticity + flagPenalty * 0.5);
+  marketingOverclaim = Math.min(10, marketingOverclaim + flagPenalty);
+  pricingValue = Math.min(10, pricingValue + flagPenalty * 0.3);
+
+  // Round to 0.5
+  return {
+    human_evidence: roundToHalf(Math.max(0, Math.min(10, humanEvidence))),
+    authenticity_transparency: roundToHalf(Math.max(0, Math.min(10, authenticity))),
+    marketing_overclaim: roundToHalf(Math.max(0, Math.min(10, marketingOverclaim))),
+    pricing_value: roundToHalf(Math.max(0, Math.min(10, pricingValue))),
+  };
+}
+
+// Extract a summary from natural text
+function extractSummary(text: string): string {
+  // Look for verdict/conclusion sections
+  const verdictPatterns = [
+    /(?:verdict|conclusion|overall|in summary|bottom line)[:\s]+([^.]+\.)/i,
+    /(?:this product|this is)\s+(?:appears to be|seems|is)\s+([^.]+\.)/i,
+  ];
+
+  for (const pattern of verdictPatterns) {
+    const match = text.match(pattern);
+    if (match && match[1] && match[1].length > 30) {
+      return match[1].trim();
+    }
+  }
+
+  // Fall back to first substantive paragraph
+  const paragraphs = text.split(/\n\n+/).filter(p => p.length > 100);
+  if (paragraphs.length > 0) {
+    // Get first 2-3 sentences
+    const sentences = paragraphs[0].match(/[^.!?]+[.!?]+/g) || [];
+    return sentences.slice(0, 3).join(' ').trim().substring(0, 500);
+  }
+
+  return text.substring(0, 300).trim();
+}
+
+// Main Phase 2 extraction function - uses NEW scoring schema v2.0
+function extractStructuredData(
+  perplexityResponse: string,
+  citations: string[] = [],
+  sourceUrl?: string,
+  pageContent: string = ''
+): BunkdAnalysisResult {
+  // ========================================================================
+  // NEW SCORING SCHEMA v2.0
+  // ========================================================================
+
+  // 1. Detect category candidates using new schema
+  const categoryCandidates = detectCategoryCandidates(perplexityResponse, sourceUrl);
+  const primaryCategory = categoryCandidates[0] || BUNKD_SCORING_CONFIG.categoryDetection.fallback;
+
+  console.log(`    Category detected: ${primaryCategory.id} (confidence: ${(primaryCategory.confidence * 100).toFixed(0)}%)`);
+
+  // 2. Extract primitives from text
+  const primitives = extractPrimitivesFromText(perplexityResponse, pageContent);
+
+  console.log(`    Primitives extracted:`);
+  console.log(`      evidence_quality: ${primitives.evidence_quality.toFixed(2)}`);
+  console.log(`      transparency: ${primitives.transparency.toFixed(2)}`);
+  console.log(`      presentation_risk: ${primitives.presentation_risk.toFixed(2)}`);
+
+  // 3. Extract signals for the primary category
+  const signals = extractSignalsForCategory(primaryCategory.id, perplexityResponse, pageContent);
+  const signalsByCategory: Partial<Record<CategoryId, Signal[]>> = {
+    [primaryCategory.id]: signals,
+  };
+
+  console.log(`    Signals found: ${signals.length}`);
+
+  // 4. Score using new schema
+  const scoreResult = scoreBSMeter({
+    primitives,
+    categoryCandidates,
+    signalsByCategory,
+  });
+
+  console.log(`    Score breakdown:`);
+  console.log(`      baseRisk01: ${scoreResult.baseRisk01.toFixed(3)}`);
+  console.log(`      harmMultiplier: ${scoreResult.harmMultiplier}`);
+  console.log(`      penalties01: ${scoreResult.overlay.penalties01.toFixed(3)}`);
+  console.log(`      credits01: ${scoreResult.overlay.credits01.toFixed(3)}`);
+  console.log(`      finalScore10: ${scoreResult.finalScore10}`);
+
+  // 5. Map to legacy subscores for backward compatibility
+  const legacySubscores = mapToLegacySubscores(primitives, scoreResult);
+
+  console.log(`    Legacy subscores: HE=${legacySubscores.human_evidence}, AT=${legacySubscores.authenticity_transparency}, MO=${legacySubscores.marketing_overclaim}, PV=${legacySubscores.pricing_value}`);
+
+  // ========================================================================
+  // EXTRACT DISPLAY CONTENT (unchanged)
+  // ========================================================================
+  const claims = extractClaims(perplexityResponse);
+  const redFlags = extractRedFlags(perplexityResponse);
+  const evidenceBullets = extractEvidenceBullets(perplexityResponse);
+  const summary = extractSummary(perplexityResponse);
+
+  // Format citations
+  const formattedCitations = citations.map((url, i) => ({
+    title: `Source ${i + 1}`,
+    url: url,
+  }));
+
+  // Ensure minimums for UI
+  const finalClaims = claims.length >= 3 ? claims : [
+    ...claims,
+    { claim: 'Product makes various marketing claims', support_level: 'mixed', why: 'Requires further verification' },
+    { claim: 'Benefits described on product page', support_level: 'mixed', why: 'Based on manufacturer claims' },
+    { claim: 'Results may vary by individual', support_level: 'mixed', why: 'Common disclaimer' },
+  ].slice(0, 5);
+
+  // Don't pad red flags with generic warnings - if no red flags were found,
+  // that's a GOOD sign and we should show an empty/minimal list.
+  // Only show red flags that were actually detected with evidence.
+  const finalRedFlags = redFlags.slice(0, 5);
+
+  const finalEvidence = evidenceBullets.length >= 5 ? evidenceBullets : [
+    ...evidenceBullets,
+    'Analysis based on publicly available information',
+    'Independent reviews may provide additional perspective',
+    'Product claims extracted from source material',
+    'Evidence quality varies by claim',
+    'Further research recommended for important decisions',
+  ].slice(0, 7);
+
+  // ========================================================================
+  // CONFIDENCE GATING (using new shrinkToMidpoint approach)
+  // ========================================================================
+  const confidence = scoreResult.category.confidence;
+  const unableToScore = confidence < 0.5;
+
+  const result: BunkdAnalysisResult = {
+    version: 'bunkd_v1',
+    scoring_version: '2.0',
+    summary,
+    evidence_bullets: finalEvidence,
+    key_claims: finalClaims as any,
+    red_flags: finalRedFlags,
+    subscores: legacySubscores,
+    // New fields for v2.0
+    category: primaryCategory.id,
+    category_confidence: primaryCategory.confidence,
+    pillar_scores: primitives,
+    score_breakdown: {
+      baseRisk01: scoreResult.baseRisk01,
+      harmMultiplier: scoreResult.harmMultiplier,
+      penalties01: scoreResult.overlay.penalties01,
+      credits01: scoreResult.overlay.credits01,
+      confidenceAdjusted01: scoreResult.confidenceAdjusted01,
+    },
+    citations: formattedCitations,
+    product_details: {
+      name: 'Extracted from analysis',
+      clinical_studies: evidenceBullets.some(b => /study|trial/i.test(b)) ? 'Referenced in analysis' : 'Not found',
+    },
+    confidence,
+  };
+
+  if (unableToScore) {
+    result.unable_to_score = true;
+    result.insufficient_data_reason = `Confidence too low (${(confidence * 100).toFixed(0)}%) - insufficient evidence to provide a reliable score`;
+    console.log(`    ⚠️  Unable to score: ${result.insufficient_data_reason}`);
+  } else if (confidence < 0.7) {
+    result.bunk_score = scoreResult.finalScore10;
+    result.verdict = getVerdictFromScore(scoreResult.finalScore10);
+    result.disclaimers = ['Score based on limited evidence - treat as preliminary assessment'];
+    console.log(`    ⚠️  Limited confidence score: ${scoreResult.finalScore10} (${result.verdict})`);
+  } else {
+    result.bunk_score = scoreResult.finalScore10;
+    result.verdict = getVerdictFromScore(scoreResult.finalScore10);
+    console.log(`    ✓ High confidence score: ${scoreResult.finalScore10} (${result.verdict})`);
+  }
+
+  return result;
+}
+
+// Helper to get verdict from score (uses new interpretation ranges)
+function getVerdictFromScore(score: number): "low" | "elevated" | "high" {
+  const { interpretation } = BUNKD_SCORING_CONFIG.output;
+  if (score <= interpretation.low.range[1]) return "low";
+  if (score <= interpretation.mid.range[1]) return "elevated";
+  return "high";
+}
+
+// Legacy function for backward compatibility - now wraps two-phase approach
 export function buildPerplexityRequestBody(input: {
   input_type: "url" | "text" | "image";
   input_value: string;
   normalized_input?: string;
   cache_key?: string;
 }): object {
-  const normalizedInput = input.normalized_input || input.input_value;
-
-  const systemMessage = `You are a product analysis research engine for Bunkd. Output a plain-text report using the exact format below.
-
-REQUIRED OUTPUT FORMAT:
-
-BUNKD_V1
-SUMMARY:
-<1-3 sentences on one line>
-EVIDENCE_BULLETS:
-- <bullet 1>
-- <bullet 2>
-- <bullet 3>
-- <bullet 4>
-- <bullet 5>
-SUBSCORES:
-human_evidence=<number 0-10>
-authenticity_transparency=<number 0-10>
-marketing_overclaim=<number 0-10>
-pricing_value=<number 0-10>
-KEY_CLAIMS:
-- <claim> | <supported|mixed|weak|unsupported> | <why>
-- <claim> | <supported|mixed|weak|unsupported> | <why>
-- <claim> | <supported|mixed|weak|unsupported> | <why>
-RED_FLAGS:
-- <flag 1>
-- <flag 2>
-- <flag 3>
-CITATIONS:
-- <title> | <url>
-- <title> | <url>
-- <title> | <url>
-- <title> | <url>
-
-SCORING RUBRIC (higher = more bunk):
-- human_evidence (0-10): 0 = strong RCTs/studies; 10 = no human evidence
-- authenticity_transparency (0-10): 0 = COA/third-party tested; 10 = no transparency
-- marketing_overclaim (0-10): 0 = claims match evidence; 10 = claims far exceed evidence
-- pricing_value (0-10): 0 = fair value; 10 = predatory pricing
-
-RULES:
-- Output MUST contain ALL section headers exactly once
-- Provide 5-10 evidence bullets
-- Provide 3-8 key claims
-- Provide 3-8 red flags
-- Provide at least 4 citations
-- ALL subscores must use 0.5 increments (e.g., 7.5, 8.0, 8.5)
-- No JSON. No markdown fences. No extra preamble.
-- Start output with BUNKD_V1 on first line`;
-
-  let userMessage: string;
-  if (input.input_type === 'url') {
-    userMessage = `Analyze this product page URL: ${normalizedInput}`;
-  } else if (input.input_type === 'text') {
-    userMessage = `Analyze these claims: ${normalizedInput}`;
-  } else if (input.input_type === 'image') {
-    userMessage = `[Image analysis not yet implemented] URL: ${normalizedInput}`;
-  } else {
-    userMessage = normalizedInput;
-  }
-
-  return {
-    model: "sonar-pro",
-    messages: [
-      {
-        role: "system",
-        content: systemMessage,
-      },
-      {
-        role: "user",
-        content: userMessage,
-      },
-    ],
-    temperature: 0.1,
-    max_tokens: 700,
-  };
+  // Now just returns Phase 1 request
+  return buildPhase1Request(input);
 }
 
 // Removed old validateAnalysisResult - now using parseBunkdReport for text-based parsing
@@ -479,7 +1989,7 @@ function parseBunkdReport(text: string): {
 }
 
 // Parse and validate response content using report format
-function parseAndValidateResponse(rawContent: string): {
+function parseAndValidateResponse(rawContent: string, pageContentLength?: number): {
   valid: boolean;
   result?: BunkdAnalysisResult;
   errors: string[];
@@ -511,32 +2021,62 @@ function parseAndValidateResponse(rawContent: string): {
       };
     }
 
-    // Step 3: Compute bunk_score and verdict deterministically
-    const computedScore = computeBunkScore(parseResult.result.subscores);
-    const computedVerdict = verdictFromScore(computedScore);
+    // Step 3: Check for insufficient data BEFORE scoring
+    const insufficientDataCheck = detectInsufficientData(
+      parseResult.result,
+      pageContentLength
+    );
 
     // Step 4: Adjust confidence and red_flags based on citation count
     let confidence = 0.7; // Default confidence
     let redFlags = [...parseResult.result.red_flags];
 
     if (parseResult.result.citations.length < 2) {
-      confidence = Math.min(confidence, 0.6);
+      confidence = Math.min(confidence, 0.5);
       redFlags.push('Limited citations returned; treat evidence strength cautiously.');
     }
 
-    // Step 5: Build final result with computed values
-    const finalResult: BunkdAnalysisResult = {
-      version: 'bunkd_v1',
-      bunk_score: computedScore,
-      confidence: confidence,
-      verdict: computedVerdict,
-      summary: parseResult.result.summary,
-      evidence_bullets: parseResult.result.evidence_bullets,
-      subscores: parseResult.result.subscores,
-      key_claims: parseResult.result.key_claims,
-      red_flags: redFlags,
-      citations: parseResult.result.citations
-    };
+    // Step 5: Build final result
+    let finalResult: BunkdAnalysisResult;
+
+    if (insufficientDataCheck.insufficient) {
+      // Insufficient data - don't compute score
+      console.log(`  ⚠️  Insufficient data detected: ${insufficientDataCheck.reason}`);
+
+      finalResult = {
+        version: 'bunkd_v1',
+        unable_to_score: true,
+        insufficient_data_reason: insufficientDataCheck.reason,
+        confidence: 0.3, // Low confidence
+        summary: parseResult.result.summary,
+        evidence_bullets: parseResult.result.evidence_bullets,
+        subscores: parseResult.result.subscores,
+        key_claims: parseResult.result.key_claims,
+        red_flags: redFlags,
+        citations: parseResult.result.citations,
+        product_details: parseResult.result.product_details,
+        disclaimers: parseResult.result.disclaimers,
+      };
+    } else {
+      // Sufficient data - compute score normally
+      const computedScore = computeBunkScore(parseResult.result.subscores);
+      const computedVerdict = verdictFromScore(computedScore);
+
+      finalResult = {
+        version: 'bunkd_v1',
+        bunk_score: computedScore,
+        confidence: confidence,
+        verdict: computedVerdict,
+        summary: parseResult.result.summary,
+        evidence_bullets: parseResult.result.evidence_bullets,
+        subscores: parseResult.result.subscores,
+        key_claims: parseResult.result.key_claims,
+        red_flags: redFlags,
+        citations: parseResult.result.citations,
+        product_details: parseResult.result.product_details,
+        disclaimers: parseResult.result.disclaimers,
+      };
+    }
 
     return {
       valid: true,
@@ -554,110 +2094,91 @@ function parseAndValidateResponse(rawContent: string): {
   }
 }
 
-// Process a single job with validation and retry
+// Process a single job using two-phase approach
 async function processJob(job: Job): Promise<void> {
   console.log(`[${job.id.substring(0, 8)}] Processing job (attempt ${job.attempts})`);
   console.log(`  Input type: ${job.input_type}`);
   console.log(`  Input length: ${job.normalized_input.length}`);
 
   try {
-    // Build request body
-    const requestBody = buildPerplexityRequestBody({
+    // =================================================================
+    // PRE-PHASE: Fetch page content for URL inputs
+    // =================================================================
+    let pageContent: string | undefined;
+
+    if (job.input_type === 'url') {
+      console.log(`  🌐 Fetching page content from URL...`);
+      const fetchResult = await fetchPageText(job.normalized_input);
+
+      if (fetchResult.success) {
+        pageContent = fetchResult.content;
+        console.log(`  ✓ Page fetched: ${pageContent.length} characters`);
+
+        // Log a preview of key product details found
+        const priceMatch = pageContent.match(/\$[\d,.]+/g);
+        const volumeMatch = pageContent.match(/\d+\s*(?:ml|oz|g|mg)/gi);
+        if (priceMatch) console.log(`    Prices found: ${priceMatch.slice(0, 3).join(', ')}${priceMatch.length > 3 ? '...' : ''}`);
+        if (volumeMatch) console.log(`    Volumes found: ${volumeMatch.slice(0, 3).join(', ')}${volumeMatch.length > 3 ? '...' : ''}`);
+      } else {
+        console.warn(`  ⚠️  Failed to fetch page: ${fetchResult.error}`);
+        console.log(`  Continuing with Perplexity-only research...`);
+      }
+    }
+
+    // =================================================================
+    // PHASE 1: Research with page content constraint (if available)
+    // =================================================================
+    console.log(`  📡 PHASE 1: Research ${pageContent ? '(with page content constraint)' : '(unconstrained)'}...`);
+
+    const phase1Request = buildPhase1Request({
       input_type: job.input_type as "url" | "text" | "image",
       input_value: job.input_value,
       normalized_input: job.normalized_input,
-      cache_key: job.cache_key,
+      pageContent: pageContent,
     });
 
-    // Log first 120 chars of user message to verify it's the target (not schema text)
-    const userMsg = (requestBody as any).messages?.find((m: any) => m.role === 'user')?.content || '';
-    console.log(`  User message preview: ${userMsg.substring(0, 120)}...`);
+    // Log user message preview (truncated since it may include page content)
+    const userMsg = (phase1Request as any).messages?.find((m: any) => m.role === 'user')?.content || '';
+    const previewEnd = userMsg.indexOf('=== PAGE CONTENT');
+    const preview = previewEnd > 0 ? userMsg.substring(0, previewEnd) : userMsg.substring(0, 100);
+    console.log(`  User message preview: ${preview.trim()}...`);
 
-    // Call Perplexity (initial attempt)
-    console.log(`  Calling Perplexity (model: sonar-pro)...`);
-    let { response, latencyMs } = await callPerplexity(requestBody);
+    // Call Perplexity for research
+    const { response, latencyMs } = await callPerplexity(phase1Request);
     console.log(`  ✓ Perplexity responded in ${latencyMs}ms`);
 
     // Extract content
-    let content = response.choices[0]?.message?.content || '';
-    if (!content) {
+    const researchContent = response.choices[0]?.message?.content || '';
+    if (!researchContent) {
       throw new Error('Empty response from Perplexity');
     }
 
-    // Parse and validate
-    let parseResult = parseAndValidateResponse(content);
+    // Log research response preview
+    console.log(`  Research response (first 300 chars): ${researchContent.substring(0, 300)}...`);
 
-    // If validation failed, retry ONCE with replacement message
-    if (!parseResult.valid) {
-      console.warn(`  ⚠️  Schema validation failed (${parseResult.errors.length} errors):`);
-      parseResult.errors.forEach(err => console.warn(`     - ${err}`));
+    // Extract citations from Perplexity response
+    const citations = response.citations || [];
+    console.log(`  Citations found: ${citations.length}`);
 
-      // Log extracted content and missing headers
-      if (parseResult.extractedContent) {
-        console.warn(`  Content preview (first 200 chars): ${parseResult.extractedContent.substring(0, 200)}`);
-      }
-      if (parseResult.missingHeaders && parseResult.missingHeaders.length > 0) {
-        console.warn(`  Missing headers: ${parseResult.missingHeaders.join(', ')}`);
-      }
+    // =================================================================
+    // PHASE 2: Extract structured data from natural language response
+    // =================================================================
+    console.log(`  🔬 PHASE 2: Extraction (parsing research into structured data)...`);
 
-      console.log(`  Retrying with strict replacement message...`);
+    // Pass URL for category detection (helps identify OEM sites, travel sites, etc.)
+    // Also pass pageContent for pack-based scoring
+    const sourceUrl = job.input_type === 'url' ? job.normalized_input : undefined;
+    const result = extractStructuredData(researchContent, citations, sourceUrl, pageContent || '');
 
-      // Replace the user message entirely (do NOT append)
-      const originalMessages = (requestBody as any).messages || [];
-      const systemMessage = originalMessages.find((m: any) => m.role === 'system');
+    console.log(`  ✓ Subscores computed: HE=${result.subscores.human_evidence}, AT=${result.subscores.authenticity_transparency}, MO=${result.subscores.marketing_overclaim}, PV=${result.subscores.pricing_value}`);
+    console.log(`  ✓ Extracted: ${result.key_claims.length} claims, ${result.red_flags.length} red flags, ${result.evidence_bullets.length} evidence points`);
 
-      const strictUserMessage = job.input_type === 'url'
-        ? `RETRY: Output the exact BUNKD_V1 format with all required headers. No extra text. Analyze this URL: ${job.normalized_input}`
-        : `RETRY: Output the exact BUNKD_V1 format with all required headers. No extra text. Analyze these claims: ${job.normalized_input}`;
-
-      const retryBody = {
-        ...requestBody,
-        messages: [
-          systemMessage,
-          {
-            role: "user",
-            content: strictUserMessage,
-          },
-        ],
-      };
-
-      const retryResponse = await callPerplexity(retryBody);
-      response = retryResponse.response;
-      latencyMs = retryResponse.latencyMs;
-      content = response.choices[0]?.message?.content || '';
-
-      console.log(`  ✓ Retry response received in ${latencyMs}ms`);
-
-      // Validate retry response
-      parseResult = parseAndValidateResponse(content);
-
-      if (!parseResult.valid) {
-        console.error(`  ❌ Retry validation failed (${parseResult.errors.length} errors):`);
-        parseResult.errors.forEach(err => console.error(`     - ${err}`));
-
-        // Log extracted content on retry failure
-        if (parseResult.extractedContent) {
-          console.error(`  Retry content preview (first 200 chars): ${parseResult.extractedContent.substring(0, 200)}`);
-        }
-
-        // Mark job as failed (do NOT requeue endlessly)
-        const errorMessage = `Schema validation failed after retry: ${parseResult.errors.join('; ')}`;
-        await supabase
-          .from('analysis_jobs')
-          .update({
-            status: 'failed',
-            last_error_code: 'SCHEMA_VALIDATION_FAILED',
-            last_error_message: errorMessage,
-          })
-          .eq('id', job.id);
-
-        throw new Error(errorMessage);
-      }
+    // Log score result based on confidence gating
+    if (result.unable_to_score) {
+      console.log(`  ⚠️ Unable to score: ${result.insufficient_data_reason}`);
+    } else {
+      console.log(`  ✓ Computed Bunk Score: ${result.bunk_score} | Verdict: ${result.verdict} | Confidence: ${(result.confidence * 100).toFixed(0)}%`);
     }
-
-    const result = parseResult.result!;
-    console.log(`  ✓ Subscores received: HE=${result.subscores.human_evidence}, AT=${result.subscores.authenticity_transparency}, MO=${result.subscores.marketing_overclaim}, PV=${result.subscores.pricing_value}`);
-    console.log(`  ✓ Computed Bunk Score: ${result.bunk_score} | Verdict: ${result.verdict}`);
 
     // Update job to done
     const { error: updateError } = await supabase
@@ -676,7 +2197,7 @@ async function processJob(job: Job): Promise<void> {
       throw updateError;
     }
 
-    console.log(`  ✓ Job completed successfully`);
+    console.log(`  ✓ Job completed successfully (two-phase)`);
 
   } catch (error: any) {
     console.error(`  ❌ Job failed:`, error.message);

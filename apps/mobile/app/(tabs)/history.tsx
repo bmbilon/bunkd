@@ -29,10 +29,20 @@ export default function HistoryScreen() {
 
   const loadHistory = async () => {
     try {
-      // Use test user ID for now (authentication can be added later)
-      const TEST_USER_ID = "00000000-0000-0000-0000-000000000000";
+      // Get the current user's ID from the session
+      const { data: { session } } = await supabase.auth.getSession();
+      const userId = session?.user?.id;
+
+      if (!userId) {
+        console.log('[History] No authenticated user found');
+        setHistory([]);
+        return;
+      }
+
+      console.log('[History] Loading history for user:', userId);
 
       // Fetch user's product inputs with job status
+      // Use left join (no !inner) so we get inputs even if analysis isn't done
       const { data, error } = await supabase
         .from('product_inputs')
         .select(`
@@ -41,14 +51,14 @@ export default function HistoryScreen() {
           input_value,
           created_at,
           job_id,
-          analysis_jobs!inner (
+          analysis_jobs (
             status,
             analysis_results (
               result_data
             )
           )
         `)
-        .eq('user_id', TEST_USER_ID)
+        .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .limit(50);
 

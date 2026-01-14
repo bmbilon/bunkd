@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -8,6 +8,9 @@ import {
   ScrollView,
   ActivityIndicator,
   Alert,
+  Animated,
+  Keyboard,
+  TouchableWithoutFeedback,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { BunkdAPI, AnalysisResult } from '../../lib/api';
@@ -94,6 +97,30 @@ Order now and receive:
 *Some restrictions apply`,
 };
 
+// BS Detection Tips for loading screen
+const BS_DETECTION_TIPS = [
+  "Red flag: 'Clinically proven' without linking the actual study",
+  "If it sounds too good to be true, it's probably BS",
+  "Celebrity endorsements ≠ scientific evidence",
+  "Watch for weasel words: 'may help', 'supports', 'promotes'",
+  "'Natural' doesn't mean safe. Arsenic is natural.",
+  "Before/after photos can be lighting, angles, or Photoshop",
+  "Check if 'studies' were funded by the company selling the product",
+  "Proprietary blend = we won't tell you what's actually in it",
+  "Real science welcomes scrutiny. BS hides from it.",
+  "Five-star reviews can be bought. Look for verified purchases.",
+  "Beware of urgent pressure: 'Limited time!', 'Only 3 left!'",
+  "'FDA-registered facility' doesn't mean FDA-approved product",
+  "Testimonials are cherry-picked. Where's the independent data?",
+  "Multiple exclamation marks!!! = trying too hard to convince you",
+  "Watch for vague science: 'breakthrough formula', 'revolutionary'",
+  "'As seen on TV' just means they bought advertising time",
+  "Dramatic discounts (90% off!) suggest inflated original prices",
+  "Anonymous experts ('leading scientists say') are red flags",
+  "If they hide the ingredient list, they're hiding something",
+  "Results 'vary' = most people probably won't see any results",
+];
+
 export default function AnalyzeScreen() {
   const router = useRouter();
   const [activeTab, setActiveTab] = useState<'url' | 'text' | 'image'>('url');
@@ -102,11 +129,54 @@ export default function AnalyzeScreen() {
   const [imageUrl, setImageUrl] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
+  const [currentTipIndex, setCurrentTipIndex] = useState(0);
+  const [isCancelled, setIsCancelled] = useState(false);
+  const fadeAnim = useRef(new Animated.Value(1)).current;
 
   const loadDemo = (demoKey: keyof typeof DEMO_EXAMPLES) => {
     if (isAnalyzing) return;
     setActiveTab('text');
     setText(DEMO_EXAMPLES[demoKey]);
+  };
+
+  // Rotate tips every 4.5 seconds with fade transition
+  useEffect(() => {
+    if (!isAnalyzing) return;
+
+    const interval = setInterval(() => {
+      // Fade out
+      Animated.timing(fadeAnim, {
+        toValue: 0,
+        duration: 300,
+        useNativeDriver: true,
+      }).start(() => {
+        // Change tip
+        setCurrentTipIndex((prev) => (prev + 1) % BS_DETECTION_TIPS.length);
+        // Fade in
+        Animated.timing(fadeAnim, {
+          toValue: 1,
+          duration: 300,
+          useNativeDriver: true,
+        }).start();
+      });
+    }, 4500);
+
+    return () => clearInterval(interval);
+  }, [isAnalyzing, fadeAnim]);
+
+  // Reset states when starting analysis
+  useEffect(() => {
+    if (isAnalyzing) {
+      setIsCancelled(false);
+      setCurrentTipIndex(0);
+      fadeAnim.setValue(1);
+    }
+  }, [isAnalyzing, fadeAnim]);
+
+  const handleCancel = () => {
+    setIsCancelled(true);
+    setIsAnalyzing(false);
+    setStatusMessage('');
   };
 
   const handleAnalyze = async () => {
@@ -130,17 +200,20 @@ export default function AnalyzeScreen() {
       // Submit analysis
       const response = await BunkdAPI.analyzeProduct(input);
 
-      // If cached result, navigate immediately
+      // If cached result, navigate immediately (unless cancelled)
       if (response.status === 'cached' && response.result_json) {
         setIsAnalyzing(false);
-        router.push({
-          pathname: '/result',
-          params: {
-            result: JSON.stringify(response.result_json),
-            bsScore: response.bs_score?.toString() || '0',
-            cached: 'true',
-          },
-        });
+        if (!isCancelled) {
+          router.push({
+            pathname: '/result',
+            params: {
+              result: JSON.stringify(response.result_json),
+              bsScore: response.bs_score?.toString() || '0',
+              cached: 'true',
+              input: JSON.stringify(input),
+            },
+          });
+        }
         return;
       }
 
@@ -162,6 +235,9 @@ export default function AnalyzeScreen() {
 
         setIsAnalyzing(false);
 
+        // Don't navigate if user cancelled
+        if (isCancelled) return;
+
         if (result.status === 'done' && result.result_json) {
           router.push({
             pathname: '/result',
@@ -169,6 +245,7 @@ export default function AnalyzeScreen() {
               result: JSON.stringify(result.result_json),
               bsScore: result.bs_score?.toString() || '0',
               jobId: response.job_id,
+              input: JSON.stringify(input),
             },
           });
         } else if (result.status === 'failed') {
@@ -230,8 +307,9 @@ export default function AnalyzeScreen() {
   };
 
   return (
-    <ScrollView style={styles.container}>
-      <View style={styles.content}>
+    <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+      <ScrollView style={styles.container} keyboardShouldPersistTaps="handled">
+        <View style={styles.content}>
         <Text style={styles.title}>Calculate BS (Bunkd Score)</Text>
         <Text style={styles.subtitle}>
           Get an objective analysis of marketing claims and bias
@@ -300,6 +378,18 @@ export default function AnalyzeScreen() {
           <View style={styles.statusContainer}>
             <ActivityIndicator size="large" color="#007AFF" />
             <Text style={styles.statusText}>{statusMessage}</Text>
+
+            <Animated.View style={[styles.tipContainer, { opacity: fadeAnim }]}>
+              <Text style={styles.tipLabel}>💡 BS Detection Tip:</Text>
+              <Text style={styles.tipText}>{BS_DETECTION_TIPS[currentTipIndex]}</Text>
+            </Animated.View>
+
+            <TouchableOpacity
+              style={styles.cancelButton}
+              onPress={handleCancel}
+            >
+              <Text style={styles.cancelButtonText}>Cancel</Text>
+            </TouchableOpacity>
           </View>
         )}
 
@@ -312,15 +402,16 @@ export default function AnalyzeScreen() {
             {isAnalyzing ? 'Analyzing...' : 'Analyze'}
           </Text>
         </TouchableOpacity>
-      </View>
-    </ScrollView>
+        </View>
+      </ScrollView>
+    </TouchableWithoutFeedback>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: '#030712', // Dark navy background (gray-950)
   },
   content: {
     padding: 20,
@@ -328,18 +419,18 @@ const styles = StyleSheet.create({
   },
   title: {
     fontSize: 32,
-    fontWeight: 'bold',
+    fontWeight: '900', // Font black
     marginBottom: 8,
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
   },
   subtitle: {
     fontSize: 16,
-    color: '#666',
+    color: '#9ca3af', // Muted text (gray-400)
     marginBottom: 30,
   },
   tabContainer: {
     flexDirection: 'row',
-    backgroundColor: '#e0e0e0',
+    backgroundColor: '#1f2937', // Dark gray (gray-800)
     borderRadius: 12,
     padding: 4,
     marginBottom: 20,
@@ -351,25 +442,26 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   activeTab: {
-    backgroundColor: '#fff',
+    backgroundColor: '#111827', // Darker gray (gray-900)
   },
   tabText: {
     fontSize: 16,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
     fontWeight: '500',
   },
   activeTabText: {
-    color: '#000',
+    color: '#f3f4f6', // White when active
     fontWeight: '600',
   },
   input: {
-    backgroundColor: '#fff',
+    backgroundColor: '#111827', // Dark card background (gray-900)
     borderRadius: 12,
     padding: 16,
     fontSize: 16,
     marginBottom: 20,
     borderWidth: 1,
-    borderColor: '#e0e0e0',
+    borderColor: '#1f2937', // Dark border (gray-800)
+    color: '#f3f4f6', // White text
   },
   textArea: {
     minHeight: 150,
@@ -381,29 +473,64 @@ const styles = StyleSheet.create({
   statusText: {
     marginTop: 12,
     fontSize: 16,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
+  },
+  tipContainer: {
+    marginTop: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: '#1f2937', // Dark gray background (gray-800)
+    borderRadius: 10,
+    borderLeftWidth: 3,
+    borderLeftColor: '#ea580c', // Orange accent (orange-600)
+    width: '100%',
+  },
+  tipLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#fb923c', // Orange-400
+    marginBottom: 6,
+  },
+  tipText: {
+    fontSize: 15,
+    color: '#d1d5db', // Gray-300
+    lineHeight: 20,
+  },
+  cancelButton: {
+    marginTop: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: '#374151', // Gray-700
+    borderRadius: 8,
+  },
+  cancelButtonText: {
+    fontSize: 16,
+    color: '#9ca3af', // Gray-400
+    fontWeight: '500',
   },
   analyzeButton: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#ea580c', // Orange-600
     borderRadius: 12,
     padding: 18,
     alignItems: 'center',
     marginTop: 10,
   },
   analyzeButtonDisabled: {
-    backgroundColor: '#ccc',
+    backgroundColor: '#374151', // Gray-700 when disabled
   },
   analyzeButtonText: {
     color: '#fff',
     fontSize: 18,
-    fontWeight: '600',
+    fontWeight: '700', // Bold
   },
   demoContainer: {
     marginBottom: 20,
   },
   demoLabel: {
     fontSize: 14,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
     marginBottom: 8,
     fontWeight: '500',
   },
@@ -413,16 +540,16 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   demoButton: {
-    backgroundColor: '#f0f0f0',
+    backgroundColor: '#1f2937', // Gray-800
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: '#d0d0d0',
+    borderColor: '#374151', // Gray-700
   },
   demoButtonText: {
     fontSize: 13,
-    color: '#333',
+    color: '#9ca3af', // Gray-400
     fontWeight: '500',
   },
 });

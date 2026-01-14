@@ -6,9 +6,11 @@ import {
   ScrollView,
   TouchableOpacity,
   Linking,
+  ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { AnalysisResult } from '@/lib/api';
+import { AnalysisResult, AnalyzeInput, BunkdAPI } from '@/lib/api';
 
 type TabType = 'breakdown' | 'evidence' | 'citations';
 
@@ -38,12 +40,82 @@ export default function ResultScreen() {
   const params = useLocalSearchParams();
   const [activeTab, setActiveTab] = useState<TabType>('breakdown');
   const [expandedRow, setExpandedRow] = useState<string | null>(null);
+  const [isReanalyzing, setIsReanalyzing] = useState(false);
+  const [currentResult, setCurrentResult] = useState<AnalysisResult | null>(null);
 
-  // Parse result from params
-  const result: AnalysisResult = params.result
+  // Parse result from params (use currentResult if re-analyzed, otherwise from params)
+  const parsedResult: AnalysisResult | null = params.result
     ? JSON.parse(params.result as string)
     : null;
-  const isCached = params.cached === 'true';
+  const result = currentResult || parsedResult;
+  const [isCachedState, setIsCachedState] = useState(params.cached === 'true');
+  const isCached = isCachedState;
+
+  // Parse original input for re-analysis
+  const originalInput: AnalyzeInput | null = params.input
+    ? JSON.parse(params.input as string)
+    : null;
+
+  // Handle re-analyze
+  const handleReanalyze = async () => {
+    if (!originalInput) {
+      Alert.alert('Error', 'Original input not available for re-analysis');
+      return;
+    }
+
+    setIsReanalyzing(true);
+    setCurrentResult(null); // Clear current result to show loading state
+
+    try {
+      // Submit with force_refresh
+      const response = await BunkdAPI.analyzeProduct({
+        ...originalInput,
+        force_refresh: true,
+      });
+
+      // If immediate result (shouldn't happen with force_refresh, but handle it)
+      if (response.status === 'cached' && response.result_json) {
+        setCurrentResult(response.result_json);
+        setIsCachedState(false);
+        setIsReanalyzing(false);
+        return;
+      }
+
+      // Poll for completion
+      if (response.job_id && response.job_token) {
+        const finalResult = await BunkdAPI.pollJobStatus(
+          response.job_id,
+          response.job_token,
+          () => {} // No status updates needed
+        );
+
+        if (finalResult.status === 'done' && finalResult.result_json) {
+          setCurrentResult(finalResult.result_json);
+          setIsCachedState(false);
+        } else if (finalResult.status === 'failed') {
+          Alert.alert(
+            'Re-analysis Failed',
+            finalResult.last_error_message || 'An error occurred during re-analysis'
+          );
+        }
+      }
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to re-analyze');
+    } finally {
+      setIsReanalyzing(false);
+    }
+  };
+
+  // Show loading state during re-analysis
+  if (isReanalyzing) {
+    return (
+      <View style={[styles.container, styles.loadingContainer]}>
+        <ActivityIndicator size="large" color="#ea580c" />
+        <Text style={styles.loadingText}>Re-analyzing...</Text>
+        <Text style={styles.loadingSubtext}>Getting fresh results</Text>
+      </View>
+    );
+  }
 
   if (!result) {
     return (
@@ -54,9 +126,15 @@ export default function ResultScreen() {
   }
 
   // Helper: extract score from multiple possible field names
-  const getScore = (): number => {
+  const getScore = (): number | null => {
+    // Check if unable to score
+    const data = (result as any).result_json || result;
+    if (data.unable_to_score === true) {
+      return null;
+    }
+
     const scoreValue = (result as any).bs_score ?? (result as any).bunk_score ?? (result as any).bunkd_score;
-    return typeof scoreValue === 'number' ? scoreValue : 0;
+    return typeof scoreValue === 'number' ? scoreValue : null;
   };
 
   // Helper: extract subscores from result_json or top-level
@@ -86,6 +164,15 @@ export default function ResultScreen() {
   const score = getScore();
   const subscores = getSubscores();
 
+  // Get insufficient data reason if present
+  const getInsufficientDataReason = (): string | null => {
+    const data = (result as any).result_json || result;
+    return data.insufficient_data_reason || null;
+  };
+
+  const insufficientDataReason = getInsufficientDataReason();
+  const unableToScore = score === null;
+
   const getScoreColor = (score: number): string => {
     // Higher scores = weaker evidence = RED (bad)
     // Lower scores = stronger evidence = GREEN (good)
@@ -110,8 +197,8 @@ export default function ResultScreen() {
     return { label: 'Low', color: '#34C759' };
   };
 
-  const scoreColor = getScoreColor(score);
-  const scoreTier = getScoreTier(score);
+  const scoreColor = unableToScore ? '#999' : getScoreColor(score!);
+  const scoreTier = unableToScore ? 'Unable to Score' : getScoreTier(score!);
 
   // Extract data from result_json
   const data = (result as any).result_json || result;
@@ -132,6 +219,18 @@ export default function ResultScreen() {
 
     return (
       <View style={styles.tabContent}>
+        {unableToScore && (
+          <View style={styles.insufficientDataCard}>
+            <Text style={styles.insufficientDataCardTitle}>⚠️ Insufficient Data</Text>
+            <Text style={styles.insufficientDataCardText}>
+              The analyzer could not find enough product information to calculate reliable subscores.
+            </Text>
+            <Text style={styles.insufficientDataCardText}>
+              The subscores shown below are based on very limited data and should not be relied upon.
+            </Text>
+          </View>
+        )}
+
         {SUBSCORE_ROWS.map((row) => {
           const subscoreValue = subscores[row.key];
           const contribution = row.weight * subscoreValue;
@@ -172,16 +271,18 @@ export default function ResultScreen() {
           );
         })}
 
-        <View style={styles.formulaSection}>
-          <Text style={styles.formulaLabel}>Score Formula:</Text>
-          <Text style={styles.formulaText}>BS = 0.4×HE + 0.25×AT + 0.25×MO + 0.10×PV</Text>
-          <View style={styles.computedScore}>
-            <Text style={styles.computedScoreLabel}>Computed Total:</Text>
-            <Text style={[styles.computedScoreValue, { color: scoreColor }]}>
-              {score.toFixed(1)}
-            </Text>
+        {!unableToScore && (
+          <View style={styles.formulaSection}>
+            <Text style={styles.formulaLabel}>Score Formula:</Text>
+            <Text style={styles.formulaText}>BS = 0.4×HE + 0.25×AT + 0.25×MO + 0.10×PV</Text>
+            <View style={styles.computedScore}>
+              <Text style={styles.computedScoreLabel}>Computed Total:</Text>
+              <Text style={[styles.computedScoreValue, { color: scoreColor }]}>
+                {score!.toFixed(1)}
+              </Text>
+            </View>
           </View>
-        </View>
+        )}
       </View>
     );
   };
@@ -410,6 +511,15 @@ export default function ResultScreen() {
                 <Text style={styles.cachedText}>Cached Result</Text>
               </View>
             )}
+            {originalInput && (
+              <TouchableOpacity
+                onPress={handleReanalyze}
+                style={styles.reanalyzeButton}
+                disabled={isReanalyzing}
+              >
+                <Text style={styles.reanalyzeButtonText}>Re-analyze</Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               onPress={() =>
                 router.push({
@@ -430,20 +540,41 @@ export default function ResultScreen() {
         <View style={[styles.scoreCard, { borderColor: scoreColor }]}>
           <Text style={styles.primaryLabel}>BS Meter</Text>
           <Text style={styles.secondaryLabel}>Bunkd Score</Text>
-          <View style={styles.scoreContainer}>
-            <Text style={[styles.scoreValue, { color: scoreColor }]}>
-              {score.toFixed(1)}
-            </Text>
-            <Text style={[styles.scoreMaxValue, { color: scoreColor }]}>
-              /10
-            </Text>
-          </View>
-          <Text style={[styles.scoreTier, { color: scoreColor }]}>{scoreTier}</Text>
+
+          {unableToScore ? (
+            <View style={styles.unableToScoreContainer}>
+              <Text style={styles.unableToScoreIcon}>⚠️</Text>
+              <Text style={styles.unableToScoreTitle}>Unable to Score</Text>
+              <Text style={styles.unableToScoreText}>
+                Not enough product data found to assign a reliable Bunkd Score
+              </Text>
+            </View>
+          ) : (
+            <View>
+              <View style={styles.scoreContainer}>
+                <Text style={[styles.scoreValue, { color: scoreColor }]}>
+                  {score!.toFixed(1)}
+                </Text>
+                <Text style={[styles.scoreMaxValue, { color: scoreColor }]}>
+                  /10
+                </Text>
+              </View>
+              <Text style={[styles.scoreTier, { color: scoreColor }]}>{scoreTier}</Text>
+            </View>
+          )}
         </View>
 
         {/* Summary */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Summary</Text>
+
+          {unableToScore && insufficientDataReason && (
+            <View style={styles.insufficientDataBanner}>
+              <Text style={styles.insufficientDataTitle}>Why can't we score this?</Text>
+              <Text style={styles.insufficientDataText}>{insufficientDataReason}</Text>
+            </View>
+          )}
+
           <Text style={styles.summaryText}>{result.summary}</Text>
         </View>
 
@@ -490,7 +621,7 @@ export default function ResultScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: '#030712', // Dark navy background (gray-950)
   },
   content: {
     padding: 20,
@@ -507,7 +638,7 @@ const styles = StyleSheet.create({
   },
   backButtonText: {
     fontSize: 16,
-    color: '#007AFF',
+    color: '#ea580c', // Orange-600
     fontWeight: '600',
   },
   headerRight: {
@@ -527,7 +658,7 @@ const styles = StyleSheet.create({
     color: '#000',
   },
   shareButton: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#ea580c', // Orange-600
     paddingHorizontal: 16,
     paddingVertical: 8,
     borderRadius: 12,
@@ -539,12 +670,12 @@ const styles = StyleSheet.create({
   },
   title: {
     fontSize: 32,
-    fontWeight: 'bold',
+    fontWeight: '900', // Font black
     marginBottom: 24,
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
   },
   scoreCard: {
-    backgroundColor: '#fff',
+    backgroundColor: '#111827', // Dark card background (gray-900)
     borderRadius: 20,
     padding: 32,
     alignItems: 'center',
@@ -553,14 +684,14 @@ const styles = StyleSheet.create({
   },
   primaryLabel: {
     fontSize: 28,
-    fontWeight: 'bold',
-    color: '#000',
+    fontWeight: '900', // Font black
+    color: '#f3f4f6', // White text (gray-100)
     letterSpacing: 2,
     marginBottom: 4,
   },
   secondaryLabel: {
     fontSize: 14,
-    color: '#666',
+    color: '#9ca3af', // Muted text (gray-400)
     marginBottom: 16,
   },
   scoreContainer: {
@@ -569,8 +700,8 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   scoreValue: {
-    fontSize: 64,
-    fontWeight: 'bold',
+    fontSize: 60, // Matching landing page
+    fontWeight: '900', // Font black
   },
   scoreMaxValue: {
     fontSize: 24,
@@ -583,7 +714,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   section: {
-    backgroundColor: '#fff',
+    backgroundColor: '#111827', // Dark card background (gray-900)
     borderRadius: 16,
     padding: 20,
     marginBottom: 16,
@@ -591,18 +722,18 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize: 20,
     fontWeight: '600',
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
     marginBottom: 12,
   },
   summaryText: {
     fontSize: 16,
     lineHeight: 24,
-    color: '#333',
+    color: '#d1d5db', // Body text (gray-300)
   },
   // Tab Bar Styles
   tabBar: {
     flexDirection: 'row',
-    backgroundColor: '#f0f0f0',
+    backgroundColor: '#1f2937', // Dark gray (gray-800)
     borderRadius: 12,
     padding: 4,
     marginBottom: 20,
@@ -615,12 +746,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   tabActive: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#ea580c', // Orange-600
   },
   tabText: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#666',
+    color: '#9ca3af', // Gray-400
   },
   tabTextActive: {
     color: '#fff',
@@ -635,7 +766,7 @@ const styles = StyleSheet.create({
   },
   emptyStateText: {
     fontSize: 16,
-    color: '#999',
+    color: '#9ca3af', // Gray-400
     textAlign: 'center',
   },
   // Breakdown Tab Styles
@@ -643,7 +774,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   subscoreRow: {
-    backgroundColor: '#f9f9f9',
+    backgroundColor: '#1f2937', // Dark gray (gray-800)
     borderRadius: 12,
     padding: 16,
   },
@@ -658,7 +789,7 @@ const styles = StyleSheet.create({
   subscoreLabel: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
     marginBottom: 8,
   },
   subscoreMetrics: {
@@ -669,20 +800,20 @@ const styles = StyleSheet.create({
   subscoreValue: {
     fontSize: 18,
     fontWeight: 'bold',
-    color: '#007AFF',
+    color: '#ea580c', // Orange-600
   },
   subscoreWeight: {
     fontSize: 14,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
   },
   subscoreEquals: {
     fontSize: 14,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
   },
   subscoreContribution: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
   },
   subscoreHeaderRight: {
     flexDirection: 'row',
@@ -702,28 +833,28 @@ const styles = StyleSheet.create({
   },
   expandIndicator: {
     fontSize: 12,
-    color: '#007AFF',
+    color: '#ea580c', // Orange-600
   },
   subscoreDetail: {
     marginTop: 12,
     paddingTop: 12,
     borderTopWidth: 1,
-    borderTopColor: '#e0e0e0',
+    borderTopColor: '#374151', // Gray-700
   },
   detailContent: {
     gap: 8,
   },
   detailClaimCard: {
-    backgroundColor: '#fff',
+    backgroundColor: '#111827', // Gray-900
     borderRadius: 8,
     padding: 12,
     borderWidth: 1,
-    borderColor: '#e0e0e0',
+    borderColor: '#374151', // Gray-700
   },
   detailClaimText: {
     fontSize: 14,
     lineHeight: 20,
-    color: '#333',
+    color: '#d1d5db', // Gray-300
     marginBottom: 6,
   },
   detailClaimMeta: {
@@ -744,30 +875,30 @@ const styles = StyleSheet.create({
   detailClaimWhy: {
     flex: 1,
     fontSize: 12,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
     lineHeight: 18,
   },
   detailEmptyText: {
     fontSize: 14,
-    color: '#999',
+    color: '#9ca3af', // Gray-400
     fontStyle: 'italic',
   },
   formulaSection: {
     marginTop: 20,
     paddingTop: 20,
     borderTopWidth: 2,
-    borderTopColor: '#e0e0e0',
+    borderTopColor: '#374151', // Gray-700
   },
   formulaLabel: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
     marginBottom: 6,
   },
   formulaText: {
     fontSize: 14,
     fontFamily: 'monospace',
-    color: '#666',
+    color: '#9ca3af', // Gray-400
     marginBottom: 12,
   },
   computedScore: {
@@ -778,7 +909,7 @@ const styles = StyleSheet.create({
   computedScoreLabel: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
   },
   computedScoreValue: {
     fontSize: 24,
@@ -791,7 +922,7 @@ const styles = StyleSheet.create({
   evidenceSectionTitle: {
     fontSize: 18,
     fontWeight: '600',
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
     marginBottom: 12,
   },
   bulletItem: {
@@ -800,7 +931,7 @@ const styles = StyleSheet.create({
   },
   bulletDot: {
     fontSize: 16,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
     marginRight: 8,
     marginTop: 2,
   },
@@ -808,10 +939,10 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 15,
     lineHeight: 22,
-    color: '#333',
+    color: '#d1d5db', // Gray-300
   },
   claimCard: {
-    backgroundColor: '#f9f9f9',
+    backgroundColor: '#1f2937', // Gray-800
     borderRadius: 12,
     padding: 14,
     marginBottom: 10,
@@ -819,7 +950,7 @@ const styles = StyleSheet.create({
   claimText: {
     fontSize: 15,
     lineHeight: 22,
-    color: '#333',
+    color: '#d1d5db', // Gray-300
     marginBottom: 8,
   },
   claimMeta: {
@@ -830,12 +961,12 @@ const styles = StyleSheet.create({
   claimWhy: {
     fontSize: 13,
     lineHeight: 19,
-    color: '#666',
+    color: '#9ca3af', // Gray-400
     marginTop: 4,
   },
   // Citations Tab Styles
   citationCard: {
-    backgroundColor: '#f9f9f9',
+    backgroundColor: '#1f2937', // Gray-800
     borderRadius: 12,
     padding: 16,
     marginBottom: 12,
@@ -843,12 +974,12 @@ const styles = StyleSheet.create({
   citationTitle: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#000',
+    color: '#f3f4f6', // White text (gray-100)
     marginBottom: 8,
   },
   citationUrl: {
     fontSize: 13,
-    color: '#007AFF',
+    color: '#ea580c', // Orange-600
     lineHeight: 18,
   },
   errorText: {
@@ -856,5 +987,95 @@ const styles = StyleSheet.create({
     color: '#FF3B30',
     textAlign: 'center',
     marginTop: 100,
+  },
+  unableToScoreContainer: {
+    alignItems: 'center',
+    paddingVertical: 20,
+  },
+  unableToScoreIcon: {
+    fontSize: 48,
+    marginBottom: 12,
+  },
+  unableToScoreTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#9ca3af', // Gray-400
+    marginBottom: 8,
+  },
+  unableToScoreText: {
+    fontSize: 16,
+    color: '#9ca3af', // Gray-400
+    textAlign: 'center',
+    paddingHorizontal: 20,
+    lineHeight: 22,
+  },
+  insufficientDataBanner: {
+    backgroundColor: '#FFF9E6',
+    borderLeftWidth: 4,
+    borderLeftColor: '#FFB800',
+    padding: 16,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  insufficientDataTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#8B6914',
+    marginBottom: 8,
+  },
+  insufficientDataText: {
+    fontSize: 14,
+    color: '#5A4A0F',
+    lineHeight: 20,
+  },
+  insufficientDataCard: {
+    backgroundColor: '#FFF3CD',
+    borderWidth: 1,
+    borderColor: '#FFB800',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 20,
+  },
+  insufficientDataCardTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#8B6914',
+    marginBottom: 8,
+  },
+  insufficientDataCardText: {
+    fontSize: 14,
+    color: '#5A4A0F',
+    lineHeight: 20,
+    marginBottom: 8,
+  },
+  reanalyzeButton: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: '#ea580c', // Orange-600
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+  },
+  reanalyzeButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#ea580c', // Orange-600
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingBottom: 100,
+  },
+  loadingText: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: '#f3f4f6', // Gray-100
+    marginTop: 20,
+  },
+  loadingSubtext: {
+    fontSize: 16,
+    color: '#9ca3af', // Gray-400
+    marginTop: 8,
   },
 });

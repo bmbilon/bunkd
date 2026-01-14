@@ -115,26 +115,50 @@ Worker outputs:
 - Status transitions
 - Errors (no secrets)
 
+## Testing
+
+Before deploying, test that the worker can fetch and parse product pages:
+
+```bash
+# Test fetching a product URL
+npm run test:fetch https://example.com/product-page
+```
+
+This will:
+- Fetch the page content
+- Show content statistics (length, lines)
+- Display a preview of extracted text
+- Check for common product elements (ingredients, price, volume)
+- Save full output to `test-fetch-output.txt`
+
 ## Deployment
 
-For production, run as a systemd service, Docker container, or on a platform like Railway/Render.
+The worker is deployed on **Fly.io**. See [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed instructions.
 
-Example systemd service:
+### Quick Deploy
 
-```ini
-[Unit]
-Description=Perplexity Worker
-After=network.target
+```bash
+# Interactive deployment with tests
+./deploy.sh
 
-[Service]
-Type=simple
-User=worker
-WorkingDirectory=/opt/bunkd/services/perplexity-worker
-EnvironmentFile=/opt/bunkd/services/perplexity-worker/.env
-ExecStart=/usr/bin/node dist/index.js
-Restart=always
-RestartSec=10
+# Skip tests and deploy immediately
+./deploy.sh --skip-test
 
-[Install]
-WantedBy=multi-user.target
+# Or deploy manually
+flyctl deploy
 ```
+
+### Monitor Deployment
+
+```bash
+# View logs
+flyctl logs -f
+
+# Check status
+flyctl status
+
+# Rollback if needed
+flyctl releases rollback
+```
+
+For detailed deployment instructions, troubleshooting, and monitoring, see [DEPLOYMENT.md](./DEPLOYMENT.md).

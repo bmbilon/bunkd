@@ -65,6 +65,7 @@ Deno.serve(async (req) => {
     const url = body.url;
     const text = body.text || body.content;
     const imageUrl = body.image_url || body.imageUrl;
+    const forceRefresh = body.force_refresh === true;
 
     // Determine input type and value
     let inputType: string;
@@ -95,55 +96,60 @@ Deno.serve(async (req) => {
     // Normalize input
     const normalizedInput = normalizeInput(inputType, inputValue);
 
-    // Compute cache key
-    const cacheKey = await computeCacheKey(inputType, normalizedInput);
-    console.log(`[${requestId}] Cache key: ${cacheKey.substring(0, 16)}...`);
+    // Compute cache key (add timestamp suffix if force_refresh to ensure new job)
+    let cacheKey = await computeCacheKey(inputType, normalizedInput);
+    if (forceRefresh) {
+      cacheKey = `${cacheKey}_${Date.now()}`;
+    }
+    console.log(`[${requestId}] Cache key: ${cacheKey.substring(0, 16)}...${forceRefresh ? ' (force refresh)' : ''}`);
 
     // Create Supabase client with service role (no JWT required)
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // Check cache for existing completed job
-    const { data: cachedJob, error: cacheError } = await supabase
-      .from("analysis_jobs")
-      .select("id, job_token, bs_score, result_json, updated_at")
-      .eq("cache_key", cacheKey)
-      .eq("status", "done")
-      .not("result_json", "is", null)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // Check cache for existing completed job (skip if force_refresh)
+    if (!forceRefresh) {
+      const { data: cachedJob, error: cacheError } = await supabase
+        .from("analysis_jobs")
+        .select("id, job_token, bs_score, result_json, updated_at")
+        .eq("cache_key", cacheKey)
+        .eq("status", "done")
+        .not("result_json", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-    if (cacheError) {
-      console.error(`[${requestId}] Cache lookup error:`, cacheError);
-      // Continue to enqueue
-    }
+      if (cacheError) {
+        console.error(`[${requestId}] Cache lookup error:`, cacheError);
+        // Continue to enqueue
+      }
 
-    if (cachedJob && cachedJob.result_json) {
-      console.log(`[${requestId}] ✓ Cache hit - job ${cachedJob.id}`);
-      const elapsed = Date.now() - startTime;
+      if (cachedJob && cachedJob.result_json) {
+        console.log(`[${requestId}] ✓ Cache hit - job ${cachedJob.id}`);
+        const elapsed = Date.now() - startTime;
 
-      return new Response(
-        JSON.stringify({
-          status: "cached",
-          job_id: cachedJob.id,
-          job_token: cachedJob.job_token,
-          bs_score: cachedJob.bs_score,
-          result_json: cachedJob.result_json,
-          updated_at: cachedJob.updated_at,
-        }),
-        {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            "X-Response-Time-Ms": elapsed.toString(),
+        return new Response(
+          JSON.stringify({
+            status: "cached",
+            job_id: cachedJob.id,
+            job_token: cachedJob.job_token,
+            bs_score: cachedJob.bs_score,
+            result_json: cachedJob.result_json,
+            updated_at: cachedJob.updated_at,
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Response-Time-Ms": elapsed.toString(),
+            }
           }
-        }
-      );
+        );
+      }
     }
 
-    console.log(`[${requestId}] Cache miss - enqueuing new job`);
+    console.log(`[${requestId}] ${forceRefresh ? 'Force refresh' : 'Cache miss'} - enqueuing new job`);
 
     // Enqueue new job
     const { data: newJob, error: insertError } = await supabase

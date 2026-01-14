@@ -1,0 +1,13 @@
+app = 'perplexity-worker'
+primary_region = 'sjc'
+
+[build]
+
+[processes]
+  worker = "npm run start"
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  processes = ['worker']

@@ -51,6 +51,7 @@ export interface AnalyzeInput {
   url?: string;
   text?: string;
   image_url?: string;
+  force_refresh?: boolean;
 }
 
 export interface AnalysisResult {
