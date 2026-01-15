@@ -52,23 +52,61 @@ export interface AnalyzeInput {
   text?: string;
   image_url?: string;
   force_refresh?: boolean;
+  // Disambiguation fields - when user selects from picker
+  selected_candidate_id?: string;
+  interpreted_as?: string;
 }
 
+// Disambiguation candidate from the picker
+export interface DisambiguationCandidate {
+  id: string;
+  label: string;
+  category_hint: string;
+  confidence: number;
+}
+
+// Legacy AnalysisResult type - now uses BunkdAnalysisResult fields
+// Making legacy fields optional for backwards compatibility
 export interface AnalysisResult {
-  bunkd_score: number;
-  bias_indicators: string[];
-  factual_claims: Array<{
+  // Legacy fields (optional - may not be present in new results)
+  bunkd_score?: number;
+  bias_indicators?: string[];
+  factual_claims?: Array<{
     claim: string;
     verified?: boolean;
     confidence?: number;
   }>;
-  summary: string;
   sources?: Array<{
     url?: string;
     title?: string;
     snippet?: string;
   }>;
   reasoning?: string;
+  // Common field
+  summary: string;
+  // BunkdAnalysisResult fields (optional for type compatibility)
+  bunk_score?: number;
+  bs_score?: number;
+  version?: string;
+  confidence?: number;
+  verdict?: string;
+  evidence_bullets?: string[];
+  key_claims?: Array<{
+    claim: string;
+    support_level?: string;
+    why?: string;
+  }>;
+  red_flags?: string[];
+  subscores?: {
+    human_evidence: number;
+    authenticity_transparency: number;
+    marketing_overclaim: number;
+    pricing_value: number;
+  };
+  citations?: Array<{ title: string; url: string }>;
+  interpreted_as?: string;
+  needs_disambiguation?: boolean;
+  disambiguation_candidates?: DisambiguationCandidate[];
 }
 
 export interface AnalyzeResponse {
@@ -76,15 +114,47 @@ export interface AnalyzeResponse {
   job_id: string;
   job_token: string;
   bs_score?: number;
-  result_json?: any;
+  result_json?: BunkdAnalysisResult;
   updated_at?: string;
+}
+
+// Full analysis result from worker
+export interface BunkdAnalysisResult {
+  version: 'bunkd_v1';
+  scoring_version?: string;
+  bunk_score?: number;
+  confidence: number;
+  confidence_level?: 'low' | 'medium' | 'high';
+  confidence_explanation?: string;
+  verdict?: 'low' | 'elevated' | 'high';
+  summary: string;
+  evidence_bullets: string[];
+  key_claims: Array<{
+    claim: string;
+    support_level: 'supported' | 'mixed' | 'weak' | 'unsupported';
+    why: string;
+  }>;
+  red_flags: string[];
+  subscores: {
+    human_evidence: number;
+    authenticity_transparency: number;
+    marketing_overclaim: number;
+    pricing_value: number;
+  };
+  category?: string;
+  citations: Array<{ title: string; url: string }>;
+  // Disambiguation fields
+  needs_disambiguation?: boolean;
+  disambiguation_query?: string;
+  disambiguation_candidates?: DisambiguationCandidate[];
+  interpreted_as?: string;
 }
 
 export interface JobStatusResponse {
   status: 'queued' | 'running' | 'done' | 'failed';
   job_id: string;
   bs_score?: number;
-  result_json?: any;
+  result_json?: BunkdAnalysisResult;
   updated_at?: string;
   last_error_code?: string;
   last_error_message?: string;

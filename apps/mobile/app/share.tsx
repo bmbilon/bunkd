@@ -10,7 +10,7 @@ import {
   TextInput,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { AnalysisResult } from '@/lib/api';
+import { AnalysisResult, AnalyzeInput } from '@/lib/api';
 
 export default function ShareScreen() {
   const router = useRouter();
@@ -29,7 +29,51 @@ export default function ShareScreen() {
     }
   }
 
-  const [productName, setProductName] = useState('Product Analysis');
+  // Parse original input from params
+  let originalInput: AnalyzeInput | null = null;
+  console.log('[ShareScreen] params.input:', params.input);
+  if (params.input) {
+    try {
+      originalInput = JSON.parse(params.input as string);
+      console.log('[ShareScreen] Parsed originalInput:', originalInput);
+    } catch (e: any) {
+      console.error('[ShareScreen] Input parse error:', e);
+    }
+  } else {
+    console.log('[ShareScreen] No input param received');
+  }
+
+  // Determine input type and value
+  const getInputDisplay = (): { type: 'url' | 'text'; value: string } | null => {
+    if (!originalInput) return null;
+    if (originalInput.url) {
+      return { type: 'url', value: originalInput.url };
+    }
+    if (originalInput.text) {
+      return { type: 'text', value: originalInput.text };
+    }
+    return null;
+  };
+
+  const inputDisplay = getInputDisplay();
+
+  // Default product name based on input
+  const getDefaultProductName = (): string => {
+    if (!inputDisplay) return 'Product Analysis';
+    if (inputDisplay.type === 'url') {
+      try {
+        const url = new URL(inputDisplay.value);
+        return url.hostname.replace('www.', '');
+      } catch {
+        return 'Product Analysis';
+      }
+    }
+    // For text input, truncate if needed
+    const text = inputDisplay.value;
+    return text.length > 40 ? text.substring(0, 40) + '...' : text;
+  };
+
+  const [productName, setProductName] = useState(getDefaultProductName());
 
   if (!result || parseError) {
     return (
@@ -98,23 +142,34 @@ export default function ShareScreen() {
 
   const handleShare = async () => {
     try {
+      // Build score line
       const scoreText = score !== null
-        ? `BS Meter Score: ${score.toFixed(1)}/10 - ${scoreTier}`
-        : `BS Meter: Unable to Score`;
+        ? `Bunkd Score: ${score.toFixed(1)}/10 (${scoreTier.replace('Bunkd Score', 'BS Risk').trim()})`
+        : `Bunkd Score: Unable to Score`;
 
-      const shareMessage = `${productName}
+      // Build analyzed line based on input type
+      let analyzedLine = '';
+      if (inputDisplay) {
+        if (inputDisplay.type === 'url') {
+          analyzedLine = `Analyzed: ${inputDisplay.value}`;
+        } else {
+          // For text, truncate if too long
+          const truncatedText = inputDisplay.value.length > 100
+            ? inputDisplay.value.substring(0, 100) + '...'
+            : inputDisplay.value;
+          analyzedLine = `Analyzed: "${truncatedText}"`;
+        }
+      }
 
-${scoreText}
-
+      const shareMessage = `🔍 ${scoreText}
+${analyzedLine ? `\n${analyzedLine}\n` : ''}
 ${verdict}
 
-Calculated from public claims + evidence (${currentDate})
-
-Analyzed with Bunkd - BS Meter for product claims`;
+Check your products at bunkd.app`;
 
       const shareResult = await Share.share({
         message: shareMessage,
-        title: `${productName} - BS Meter Analysis`,
+        title: `${productName} - Bunkd Analysis`,
       });
 
       if (shareResult.action === Share.sharedAction) {
@@ -153,31 +208,36 @@ Analyzed with Bunkd - BS Meter for product claims`;
 
         {/* Share Card Preview */}
         <View style={styles.shareCard}>
-          <Text style={styles.cardTitle}>{productName}</Text>
+          <Text style={styles.cardTitle}>🔍 Bunkd Analysis</Text>
 
           <View style={[styles.scoreContainer, { borderColor: scoreColor }]}>
-            <Text style={styles.bsMeterLabel}>BS Meter</Text>
+            <Text style={styles.bsMeterLabel}>Bunkd Score</Text>
             <Text style={[styles.scoreValue, { color: scoreColor }]}>
               {score !== null ? `${score.toFixed(1)}/10` : 'N/A'}
             </Text>
-            <Text style={[styles.scoreTier, { color: scoreColor }]}>{scoreTier}</Text>
+            <Text style={[styles.scoreTier, { color: scoreColor }]}>
+              {scoreTier.replace('Bunkd Score', 'BS Risk').trim()}
+            </Text>
           </View>
+
+          {inputDisplay && (
+            <View style={styles.analyzedContainer}>
+              <Text style={styles.analyzedLabel}>Analyzed:</Text>
+              <Text style={styles.analyzedText} numberOfLines={2}>
+                {inputDisplay.type === 'url'
+                  ? inputDisplay.value
+                  : `"${inputDisplay.value.length > 60 ? inputDisplay.value.substring(0, 60) + '...' : inputDisplay.value}"`}
+              </Text>
+            </View>
+          )}
 
           <View style={styles.verdictContainer}>
             <Text style={styles.verdictLabel}>Verdict:</Text>
             <Text style={styles.verdictText}>{verdict}</Text>
           </View>
 
-          <View style={styles.metaContainer}>
-            <Text style={styles.metaText}>
-              Calculated from public claims + evidence
-            </Text>
-            <Text style={styles.dateText}>{currentDate}</Text>
-          </View>
-
           <View style={styles.brandingContainer}>
-            <Text style={styles.brandingText}>Analyzed with Bunkd</Text>
-            <Text style={styles.brandingSubtext}>BS Meter for product claims</Text>
+            <Text style={styles.brandingText}>Check your products at bunkd.app</Text>
           </View>
         </View>
 
@@ -191,11 +251,11 @@ Analyzed with Bunkd - BS Meter for product claims`;
           <Text style={styles.infoTitle}>What gets shared:</Text>
           <View style={styles.infoItem}>
             <Text style={styles.infoBullet}>•</Text>
-            <Text style={styles.infoText}>Product name</Text>
+            <Text style={styles.infoText}>Bunkd score and risk level</Text>
           </View>
           <View style={styles.infoItem}>
             <Text style={styles.infoBullet}>•</Text>
-            <Text style={styles.infoText}>BS Meter score and tier</Text>
+            <Text style={styles.infoText}>Original URL or text analyzed</Text>
           </View>
           <View style={styles.infoItem}>
             <Text style={styles.infoBullet}>•</Text>
@@ -203,7 +263,7 @@ Analyzed with Bunkd - BS Meter for product claims`;
           </View>
           <View style={styles.infoItem}>
             <Text style={styles.infoBullet}>•</Text>
-            <Text style={styles.infoText}>Analysis date</Text>
+            <Text style={styles.infoText}>Link to bunkd.app</Text>
           </View>
         </View>
       </View>
@@ -300,6 +360,23 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
+  analyzedContainer: {
+    backgroundColor: '#f5f5f5',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 16,
+  },
+  analyzedLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#666',
+    marginBottom: 4,
+  },
+  analyzedText: {
+    fontSize: 14,
+    color: '#333',
+    lineHeight: 20,
+  },
   verdictContainer: {
     marginBottom: 20,
   },
@@ -314,35 +391,16 @@ const styles = StyleSheet.create({
     lineHeight: 24,
     color: '#333',
   },
-  metaContainer: {
+  brandingContainer: {
+    alignItems: 'center',
     paddingTop: 16,
     borderTopWidth: 1,
     borderTopColor: '#e0e0e0',
-    marginBottom: 16,
-  },
-  metaText: {
-    fontSize: 13,
-    color: '#666',
-    textAlign: 'center',
-  },
-  dateText: {
-    fontSize: 13,
-    color: '#666',
-    textAlign: 'center',
-    marginTop: 4,
-  },
-  brandingContainer: {
-    alignItems: 'center',
   },
   brandingText: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#000',
-  },
-  brandingSubtext: {
-    fontSize: 12,
-    color: '#666',
-    marginTop: 2,
+    color: '#007AFF',
   },
   shareButton: {
     backgroundColor: '#007AFF',

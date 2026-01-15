@@ -11,9 +11,11 @@ import {
   Animated,
   Keyboard,
   TouchableWithoutFeedback,
+  Modal,
+  Pressable,
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import { BunkdAPI, AnalysisResult } from '../../lib/api';
+import { BunkdAPI, AnalysisResult, DisambiguationCandidate, AnalyzeInput } from '../../lib/api';
 
 // Demo examples for quick testing
 const DEMO_EXAMPLES = {
@@ -133,6 +135,12 @@ export default function AnalyzeScreen() {
   const [isCancelled, setIsCancelled] = useState(false);
   const fadeAnim = useRef(new Animated.Value(1)).current;
 
+  // Disambiguation state
+  const [showDisambiguation, setShowDisambiguation] = useState(false);
+  const [disambiguationCandidates, setDisambiguationCandidates] = useState<DisambiguationCandidate[]>([]);
+  const [disambiguationQuery, setDisambiguationQuery] = useState('');
+  const [pendingInput, setPendingInput] = useState<AnalyzeInput | null>(null);
+
   const loadDemo = (demoKey: keyof typeof DEMO_EXAMPLES) => {
     if (isAnalyzing) return;
     setActiveTab('text');
@@ -179,18 +187,23 @@ export default function AnalyzeScreen() {
     setStatusMessage('');
   };
 
-  const handleAnalyze = async () => {
-    // Validate input
-    const input: any = {};
-    if (activeTab === 'url' && url.trim()) {
-      input.url = url.trim();
-    } else if (activeTab === 'text' && text.trim()) {
-      input.text = text.trim();
-    } else if (activeTab === 'image' && imageUrl.trim()) {
-      input.image_url = imageUrl.trim();
+  const handleAnalyze = async (overrideInput?: AnalyzeInput) => {
+    // Use override input (from disambiguation) or build from current state
+    let input: AnalyzeInput;
+    if (overrideInput) {
+      input = overrideInput;
     } else {
-      Alert.alert('Error', 'Please enter some content to analyze');
-      return;
+      input = {};
+      if (activeTab === 'url' && url.trim()) {
+        input.url = url.trim();
+      } else if (activeTab === 'text' && text.trim()) {
+        input.text = text.trim();
+      } else if (activeTab === 'image' && imageUrl.trim()) {
+        input.image_url = imageUrl.trim();
+      } else {
+        Alert.alert('Error', 'Please enter some content to analyze');
+        return;
+      }
     }
 
     setIsAnalyzing(true);
@@ -199,6 +212,16 @@ export default function AnalyzeScreen() {
     try {
       // Submit analysis
       const response = await BunkdAPI.analyzeProduct(input);
+
+      // Check for disambiguation response (cached or immediate)
+      if (response.result_json?.needs_disambiguation) {
+        setIsAnalyzing(false);
+        setDisambiguationQuery(response.result_json.disambiguation_query || input.text || '');
+        setDisambiguationCandidates(response.result_json.disambiguation_candidates || []);
+        setPendingInput(input);
+        setShowDisambiguation(true);
+        return;
+      }
 
       // If cached result, navigate immediately (unless cancelled)
       if (response.status === 'cached' && response.result_json) {
@@ -238,6 +261,15 @@ export default function AnalyzeScreen() {
         // Don't navigate if user cancelled
         if (isCancelled) return;
 
+        // Check for disambiguation in polled result
+        if (result.result_json?.needs_disambiguation) {
+          setDisambiguationQuery(result.result_json.disambiguation_query || input.text || '');
+          setDisambiguationCandidates(result.result_json.disambiguation_candidates || []);
+          setPendingInput(input);
+          setShowDisambiguation(true);
+          return;
+        }
+
         if (result.status === 'done' && result.result_json) {
           router.push({
             pathname: '/result',
@@ -259,6 +291,36 @@ export default function AnalyzeScreen() {
       setIsAnalyzing(false);
       Alert.alert('Error', error.message || 'Failed to analyze product');
     }
+  };
+
+  // Handle disambiguation candidate selection
+  const handleDisambiguationSelect = (candidate: DisambiguationCandidate) => {
+    setShowDisambiguation(false);
+
+    if (!pendingInput) return;
+
+    // Re-submit with selected candidate
+    const newInput: AnalyzeInput = {
+      ...pendingInput,
+      selected_candidate_id: candidate.id,
+      interpreted_as: candidate.label,
+    };
+
+    // Reset disambiguation state
+    setDisambiguationCandidates([]);
+    setDisambiguationQuery('');
+    setPendingInput(null);
+
+    // Re-analyze with the selected interpretation
+    handleAnalyze(newInput);
+  };
+
+  // Close disambiguation without selecting
+  const handleDisambiguationClose = () => {
+    setShowDisambiguation(false);
+    setDisambiguationCandidates([]);
+    setDisambiguationQuery('');
+    setPendingInput(null);
   };
 
   const renderInput = () => {
@@ -306,9 +368,86 @@ export default function AnalyzeScreen() {
     }
   };
 
+  // Helper to get category hint display text
+  const getCategoryHintDisplay = (hint: string): string => {
+    const categoryDisplayNames: Record<string, string> = {
+      'whole_foods_commodity': 'Whole Food',
+      'supplements': 'Supplement',
+      'beauty_personal_care': 'Beauty/Personal Care',
+      'tech_gadgets': 'Tech',
+      'automotive': 'Automotive',
+      'business_guru': 'Business/Coaching',
+      'general': 'General',
+    };
+    return categoryDisplayNames[hint] || hint;
+  };
+
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
       <ScrollView style={styles.container} keyboardShouldPersistTaps="handled">
+        {/* Disambiguation Modal */}
+        <Modal
+          visible={showDisambiguation}
+          animationType="slide"
+          transparent={true}
+          onRequestClose={handleDisambiguationClose}
+        >
+          <Pressable
+            style={styles.modalOverlay}
+            onPress={handleDisambiguationClose}
+          >
+            <Pressable style={styles.disambiguationSheet} onPress={(e) => e.stopPropagation()}>
+              <View style={styles.disambiguationHandle} />
+
+              <Text style={styles.disambiguationTitle}>Choose the best match</Text>
+              <Text style={styles.disambiguationSubtitle}>
+                This improves scoring accuracy for short or ambiguous queries.
+              </Text>
+
+              <Text style={styles.disambiguationQuery}>"{disambiguationQuery}"</Text>
+
+              <View style={styles.candidatesList}>
+                {disambiguationCandidates.map((candidate, index) => (
+                  <TouchableOpacity
+                    key={candidate.id}
+                    style={[
+                      styles.candidateItem,
+                      index === 0 && styles.candidateItemRecommended,
+                    ]}
+                    onPress={() => handleDisambiguationSelect(candidate)}
+                  >
+                    <View style={styles.candidateContent}>
+                      <Text style={styles.candidateLabel}>
+                        {candidate.label}
+                        {index === 0 && (
+                          <Text style={styles.recommendedBadge}> (Recommended)</Text>
+                        )}
+                      </Text>
+                      <Text style={styles.candidateCategory}>
+                        {getCategoryHintDisplay(candidate.category_hint)}
+                      </Text>
+                    </View>
+                    <Text style={styles.candidateConfidence}>
+                      {Math.round(candidate.confidence * 100)}%
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={styles.disambiguationTip}>
+                💡 Tip: Pasting a URL usually yields higher confidence.
+              </Text>
+
+              <TouchableOpacity
+                style={styles.disambiguationCancel}
+                onPress={handleDisambiguationClose}
+              >
+                <Text style={styles.disambiguationCancelText}>Cancel</Text>
+              </TouchableOpacity>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
         <View style={styles.content}>
         <Text style={styles.title}>Calculate BS (Bunkd Score)</Text>
         <Text style={styles.subtitle}>
@@ -395,7 +534,7 @@ export default function AnalyzeScreen() {
 
         <TouchableOpacity
           style={[styles.analyzeButton, isAnalyzing && styles.analyzeButtonDisabled]}
-          onPress={handleAnalyze}
+          onPress={() => handleAnalyze()}
           disabled={isAnalyzing}
         >
           <Text style={styles.analyzeButtonText}>
@@ -549,6 +688,108 @@ const styles = StyleSheet.create({
   },
   demoButtonText: {
     fontSize: 13,
+    color: '#9ca3af', // Gray-400
+    fontWeight: '500',
+  },
+  // Disambiguation Modal Styles
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    justifyContent: 'flex-end',
+  },
+  disambiguationSheet: {
+    backgroundColor: '#111827', // Gray-900
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 20,
+    paddingBottom: 40,
+    paddingTop: 12,
+    maxHeight: '80%',
+  },
+  disambiguationHandle: {
+    width: 40,
+    height: 4,
+    backgroundColor: '#374151', // Gray-700
+    borderRadius: 2,
+    alignSelf: 'center',
+    marginBottom: 20,
+  },
+  disambiguationTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#f3f4f6', // Gray-100
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  disambiguationSubtitle: {
+    fontSize: 14,
+    color: '#9ca3af', // Gray-400
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  disambiguationQuery: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fb923c', // Orange-400
+    textAlign: 'center',
+    marginBottom: 20,
+    fontStyle: 'italic',
+  },
+  candidatesList: {
+    gap: 10,
+    marginBottom: 20,
+  },
+  candidateItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#1f2937', // Gray-800
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: '#374151', // Gray-700
+  },
+  candidateItemRecommended: {
+    borderColor: '#ea580c', // Orange-600
+    borderWidth: 2,
+  },
+  candidateContent: {
+    flex: 1,
+  },
+  candidateLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#f3f4f6', // Gray-100
+    marginBottom: 4,
+  },
+  recommendedBadge: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#fb923c', // Orange-400
+  },
+  candidateCategory: {
+    fontSize: 13,
+    color: '#9ca3af', // Gray-400
+  },
+  candidateConfidence: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#6b7280', // Gray-500
+    marginLeft: 12,
+  },
+  disambiguationTip: {
+    fontSize: 13,
+    color: '#6b7280', // Gray-500
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  disambiguationCancel: {
+    alignItems: 'center',
+    paddingVertical: 12,
+  },
+  disambiguationCancelText: {
+    fontSize: 16,
     color: '#9ca3af', // Gray-400
     fontWeight: '500',
   },

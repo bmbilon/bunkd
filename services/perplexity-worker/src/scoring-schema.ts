@@ -13,10 +13,12 @@
 export type CategoryId =
   | "supplements"
   | "beauty_personal_care"
+  | "health_device"
   | "tech_gadgets"
   | "automotive"
   | "business_guru_coaching"
   | "home_improvement"
+  | "whole_foods_commodity"
   | "general";
 
 export type PrimitiveId =
@@ -151,10 +153,12 @@ export const BUNKD_SCORING_CONFIG: BunkdScoringConfig = {
   harmMultipliers: {
     supplements: 1.2,
     beauty_personal_care: 1.1,
+    health_device: 1.2,
     tech_gadgets: 1.05,
     automotive: 1.1,
     business_guru_coaching: 1.15,
     home_improvement: 1.05,
+    whole_foods_commodity: 1.0,
     general: 1.0,
   },
 
@@ -284,6 +288,60 @@ export const BUNKD_SCORING_CONFIG: BunkdScoringConfig = {
         mustConsider: ["ingredients", "INCI", "clinical study", "before and after", "dermatologist"],
         redFlags: ["instant", "miracle", "secret", "guaranteed", "clinically proven (no links)"],
         greenFlags: ["clinical trial", "in vivo", "dermatologist tested", "INCI list"],
+      },
+    },
+
+    health_device: {
+      multiplier: 1.15,
+      additive01: 0.05,
+      penalties: [
+        {
+          id: "fda_clearance_misrepresentation",
+          description: 'Claims "FDA cleared/approved" without verifiable documentation.',
+          severityPoints01: { low: 0.08, med: 0.14, high: 0.20 },
+        },
+        {
+          id: "medical_treatment_claims",
+          description: "Claims to treat, cure, or prevent medical conditions.",
+          severityPoints01: { low: 0.08, med: 0.14, high: 0.20 },
+        },
+        {
+          id: "exaggerated_efficacy_metrics",
+          description: 'Exaggerated quantitative claims ("30,000 Kegels", "11,000 contractions").',
+          severityPoints01: { low: 0.06, med: 0.12, high: 0.18 },
+        },
+        {
+          id: "exercise_equivalence_claims",
+          description: 'Unverified "equivalent to X exercises" claims.',
+          severityPoints01: { low: 0.05, med: 0.10, high: 0.15 },
+        },
+        {
+          id: "clinical_claims_no_citations",
+          description: '"Clinically proven" without linked studies or citations.',
+          severityPoints01: { low: 0.05, med: 0.10, high: 0.15 },
+        },
+      ],
+      credits: [
+        {
+          id: "verified_fda_clearance",
+          description: "FDA 510(k) clearance verifiable in FDA database.",
+          severityPoints01: { low: 0.06, med: 0.12, high: 0.18 },
+        },
+        {
+          id: "published_clinical_studies",
+          description: "Linked peer-reviewed studies on the specific device.",
+          severityPoints01: { low: 0.05, med: 0.10, high: 0.15 },
+        },
+        {
+          id: "medical_professional_oversight",
+          description: "Recommended use under medical supervision.",
+          severityPoints01: { low: 0.03, med: 0.06, high: 0.09 },
+        },
+      ],
+      cues: {
+        mustConsider: ["FDA", "510(k)", "clinical trial", "medical claims", "therapeutic", "treatment"],
+        redFlags: ["FDA cleared (no proof)", "treats [condition]", "cures", "30,000", "equivalent to"],
+        greenFlags: ["FDA 510(k) number", "clinical study link", "consult physician", "medical supervision"],
       },
     },
 
@@ -445,6 +503,40 @@ export const BUNKD_SCORING_CONFIG: BunkdScoringConfig = {
         mustConsider: ["estimate", "scope", "licensed", "insured", "warranty", "permits"],
         redFlags: ["today only", "cash discount", "no contract", "too good to be true"],
         greenFlags: ["licensed", "insured", "permit", "written estimate", "warranty"],
+      },
+    },
+
+    whole_foods_commodity: {
+      multiplier: 1.0,
+      additive01: 0.0,
+      penalties: [
+        {
+          id: "unverified_organic_claim",
+          description: "Claims 'organic' without USDA certification.",
+          severityPoints01: { low: 0.04, med: 0.08, high: 0.12 },
+        },
+        {
+          id: "misleading_origin_claims",
+          description: "Misleading origin claims (local, wild) without verification.",
+          severityPoints01: { low: 0.03, med: 0.06, high: 0.09 },
+        },
+      ],
+      credits: [
+        {
+          id: "usda_organic_certified",
+          description: "USDA organic certification verified.",
+          severityPoints01: { low: 0.04, med: 0.08, high: 0.12 },
+        },
+        {
+          id: "transparent_sourcing",
+          description: "Clear sourcing and origin information.",
+          severityPoints01: { low: 0.03, med: 0.06, high: 0.09 },
+        },
+      ],
+      cues: {
+        mustConsider: ["organic", "source", "origin", "price per unit", "freshness"],
+        redFlags: ["organic (no cert)", "premium markup", "misleading unit price"],
+        greenFlags: ["USDA organic", "local farm verified", "transparent pricing"],
       },
     },
   },
@@ -684,10 +776,12 @@ export function detectCategoryCandidates(
   const scores: Record<CategoryId, number> = {
     supplements: 0,
     beauty_personal_care: 0,
+    health_device: 0,
     tech_gadgets: 0,
     automotive: 0,
     business_guru_coaching: 0,
     home_improvement: 0,
+    whole_foods_commodity: 0,
     general: 0.5, // Base score for general
   };
 
@@ -702,6 +796,13 @@ export function detectCategoryCandidates(
       'serum', 'cream', 'skincare', 'anti-aging', 'wrinkle', 'moisturizer',
       'collagen', 'retinol', 'hyaluronic', 'beauty', 'cosmetic', 'dermatologist',
       'skin care', 'facial', 'lash', 'mascara', 'hair growth',
+    ],
+    health_device: [
+      'fda cleared', 'fda approved', 'fda registered', '510(k)', 'medical device',
+      'ems', 'tens', 'muscle stimulation', 'electrical stimulation', 'electrostimulation',
+      'pelvic floor', 'kegel', 'incontinence', 'prolapse', 'therapeutic',
+      'treats', 'treatment', 'clinical', 'contractions', 'muscle trainer',
+      'health device', 'wellness device', 'physical therapy', 'rehabilitation',
     ],
     tech_gadgets: [
       'gadget', 'app', 'software', 'charger', 'wireless', 'bluetooth',
@@ -723,6 +824,11 @@ export function detectCategoryCandidates(
       'contractor', 'renovation', 'remodel', 'plumbing', 'electrical',
       'roofing', 'hvac', 'flooring', 'kitchen', 'bathroom', 'home repair',
       'licensed', 'insured', 'permit', 'estimate',
+    ],
+    whole_foods_commodity: [
+      'fruit', 'vegetable', 'produce', 'whole food', 'commodity',
+      'organic', 'fresh', 'raw', 'unprocessed', 'natural',
+      'apple', 'banana', 'carrot', 'potato', 'rice', 'beans',
     ],
     general: [],
   };
@@ -812,13 +918,37 @@ function detectSignalSeverity(
 ): 'low' | 'med' | 'high' | null {
   // Signal-specific patterns
   const signalPatterns: Record<string, { patterns: RegExp[]; default: 'low' | 'med' | 'high' }> = {
-    // Penalties
-    illegal_fda_approved_claim: { patterns: [/fda\s+approved/i], default: 'high' },
-    disease_treatment_claims: { patterns: [/cures?|treats?|prevents?\s+(?:cancer|diabetes|disease)/i], default: 'high' },
+    // Penalties - General/Supplements
+    illegal_fda_approved_claim: {
+      patterns: [
+        /fda\s+approved/i,
+        /fda\s+cleared/i,
+        /fda\s+registered/i,
+        /approved\s+by\s+(?:the\s+)?fda/i,
+        /cleared\s+by\s+(?:the\s+)?fda/i,
+      ],
+      default: 'high'
+    },
+    disease_treatment_claims: {
+      patterns: [
+        /(?:cures?|treats?|prevents?|heals?|reverses?|eliminates?)\s+\w+/i,  // Generic: treats [anything]
+        /treat(?:s|ing|ment\s+(?:of|for))?\s+(?:uterine|pelvic|bladder|urinary)/i,  // Specific pelvic conditions
+        /treat(?:s|ing|ment\s+(?:of|for))?\s+(?:incontinence|prolapse|dysfunction)/i,
+        /(?:cures?|treats?|prevents?)\s+(?:cancer|diabetes|disease|arthritis|alzheimer)/i,
+        /(?:fights?|battles?|combats?)\s+(?:disease|cancer|infection)/i,
+      ],
+      default: 'high'
+    },
     proprietary_blend_no_dosages: { patterns: [/proprietary\s+blend/i], default: 'med' },
     no_third_party_testing: { patterns: [/no\s+third.party|not\s+third.party\s+tested/i], default: 'med' },
     missing_fda_disclaimer: { patterns: [/(?<!has\s+the\s+)fda\s+disclaimer/i], default: 'low' },
-    product_clinical_claim_without_product_data: { patterns: [/clinically\s+proven.*(?:ingredient|extract)/i], default: 'med' },
+    product_clinical_claim_without_product_data: {
+      patterns: [
+        /clinically\s+proven.*(?:ingredient|extract)/i,
+        /clinically\s+(?:proven|tested|validated)(?!\s*\[|\s*\(|\s*http|\s*www)/i,  // No citation following
+      ],
+      default: 'med'
+    },
     instant_results_claims: { patterns: [/instant\s+results|immediate\s+results/i], default: 'med' },
     before_after_unverified: { patterns: [/before\s+and\s+after|before\/after/i], default: 'low' },
     unverifiable_performance_claims: { patterns: [/\d+x\s+(?:faster|better|more)/i], default: 'med' },
@@ -837,7 +967,53 @@ function detectSignalSeverity(
     missing_terms_or_pricing: { patterns: [/(?:pricing|terms)\s+(?:unclear|not\s+(?:specified|available))/i], default: 'med' },
     heavy_scarcity_urgency: { patterns: [/act\s+now|limited\s+time|only\s+\d+\s+left/i], default: 'med' },
 
-    // Credits
+    // Penalties - Health Device specific
+    fda_clearance_misrepresentation: {
+      patterns: [
+        /fda\s+cleared(?!\s*(?:510|k|\d{6}))/i,  // FDA cleared without 510(k) number
+        /fda\s+approved(?!\s*(?:510|k|\d{6}))/i,
+        /fda\s+registered(?!\s*\d)/i,
+      ],
+      default: 'high'
+    },
+    medical_treatment_claims: {
+      patterns: [
+        /treat(?:s|ing|ment)?\s+(?:uterine|pelvic|bladder|urinary)/i,
+        /treat(?:s|ing|ment)?\s+(?:incontinence|prolapse|dysfunction|disorder)/i,
+        /(?:cures?|heals?|reverses?)\s+(?:incontinence|prolapse)/i,
+        /(?:prevents?|stops?)\s+(?:incontinence|leakage|prolapse)/i,
+        /therapeutic\s+(?:treatment|device|benefit)/i,
+      ],
+      default: 'high'
+    },
+    exaggerated_efficacy_metrics: {
+      patterns: [
+        /\d{4,}\s*(?:kegels?|contractions?|exercises?|reps?)/i,  // 1000+ kegels/contractions
+        /(?:equivalent|equal)\s+to\s+\d+\s*(?:hours?|minutes?)\s+(?:of\s+)?(?:exercise|workout|training)/i,
+        /\d+\s*(?:hours?|minutes?)\s+(?:of\s+)?(?:kegels?|exercises?)\s+in\s+\d+\s*(?:minutes?|seconds?)/i,
+        /(?:30|20|10),?000\s+(?:kegels?|contractions?)/i,  // Specific common claims
+        /(?:11|10|5),?000\s+(?:contractions?|stimulations?)/i,
+      ],
+      default: 'high'
+    },
+    exercise_equivalence_claims: {
+      patterns: [
+        /equivalent\s+to\s+(?:\d+\s+)?(?:hours?|minutes?|sessions?)\s+(?:of\s+)?(?:exercise|kegels?|training)/i,
+        /(?:same|equal)\s+(?:as|to)\s+\d+\s+(?:kegels?|exercises?|workouts?)/i,
+        /replaces?\s+\d+\s+(?:hours?|minutes?)\s+(?:of\s+)?(?:exercise|training)/i,
+      ],
+      default: 'med'
+    },
+    clinical_claims_no_citations: {
+      patterns: [
+        /clinically\s+(?:proven|tested|validated|shown)(?!\s*[\[\(]|\s*at\s+|\s*by\s+\w+\s+university)/i,
+        /(?:studies?|research|trials?)\s+(?:show|prove|demonstrate)(?!\s*[\[\(])/i,
+        /backed\s+by\s+(?:science|research|studies?)(?!\s*[\[\(])/i,
+      ],
+      default: 'med'
+    },
+
+    // Credits - General
     credible_third_party_cert: { patterns: [/nsf\s+certified|usp\s+verified|consumerlab/i], default: 'high' },
     full_transparent_supplement_facts: { patterns: [/supplement\s+facts|full\s+(?:ingredient|dosage)/i], default: 'med' },
     product_specific_clinical_trial: { patterns: [/product.specific\s+(?:clinical|study)|clinical\s+trial\s+(?:of|on)\s+(?:this|the)\s+product/i], default: 'high' },
@@ -852,6 +1028,31 @@ function detectSignalSeverity(
     verifiable_credentials: { patterns: [/licensed|insured|permit/i], default: 'med' },
     clear_return_policy: { patterns: [/return\s+policy|refund\s+policy/i], default: 'med' },
     independent_reviews_present: { patterns: [/independent\s+review|third.party\s+review/i], default: 'med' },
+
+    // Credits - Health Device specific
+    verified_fda_clearance: {
+      patterns: [
+        /510\s*\(\s*k\s*\)\s*(?:clearance|number|#)?\s*(?:K)?\d{6}/i,  // 510(k) with actual number
+        /fda\s+(?:cleared?|approved?)\s*[\[\(]?\s*(?:510|k\d{6})/i,
+      ],
+      default: 'high'
+    },
+    published_clinical_studies: {
+      patterns: [
+        /(?:published|peer.reviewed)\s+(?:study|studies|research|trial)/i,
+        /clinical\s+(?:study|trial)\s+(?:published|available)\s+(?:at|on|in)/i,
+        /pubmed|doi\.org|ncbi\.nlm/i,
+      ],
+      default: 'high'
+    },
+    medical_professional_oversight: {
+      patterns: [
+        /consult\s+(?:your\s+)?(?:doctor|physician|healthcare)/i,
+        /under\s+(?:medical|physician|doctor)\s+supervision/i,
+        /(?:recommended|supervised)\s+by\s+(?:a\s+)?(?:doctor|physician|healthcare)/i,
+      ],
+      default: 'med'
+    },
   };
 
   const config = signalPatterns[signalId];

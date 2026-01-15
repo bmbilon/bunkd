@@ -16,9 +16,9 @@ interface HistoryItem {
   input_type: string;
   input_value: string;
   created_at: string;
-  job_id: string | null;
-  analysis_status?: string;
-  bunkd_score?: number;
+  status: string;
+  bs_score: number | null;
+  result_json: any | null;
 }
 
 export default function HistoryScreen() {
@@ -41,50 +41,42 @@ export default function HistoryScreen() {
 
       console.log('[History] Loading history for user:', userId);
 
-      // Fetch user's product inputs with job status
-      // Use left join (no !inner) so we get inputs even if analysis isn't done
+      // Fetch user's analysis jobs directly
       const { data, error } = await supabase
-        .from('product_inputs')
-        .select(`
-          id,
-          input_type,
-          input_value,
-          created_at,
-          job_id,
-          analysis_jobs (
-            status,
-            analysis_results (
-              result_data
-            )
-          )
-        `)
+        .from('analysis_jobs')
+        .select('id, input_type, input_value, created_at, status, bs_score, result_json')
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .limit(50);
 
       if (error) {
-        console.error('Error loading history:', error);
+        console.error('[History] Error loading history:', error);
+        setHistory([]);
       } else if (data) {
-        // Transform data
-        const items: HistoryItem[] = data.map((item: any) => {
-          const resultData = item.analysis_jobs?.analysis_results?.[0]?.result_data;
-          // Try multiple field names for the score
-          const score = resultData?.bs_score ?? resultData?.bunk_score ?? resultData?.bunkd_score;
-
-          return {
+        console.log(`[History] Loaded ${data.length} items`);
+        // Transform data - filter out disambiguation-only results
+        const items: HistoryItem[] = data
+          .filter((item: any) => {
+            // Exclude disambiguation results that don't have a real score
+            if (item.result_json?.needs_disambiguation && item.bs_score === null) {
+              return false;
+            }
+            return true;
+          })
+          .map((item: any) => ({
             id: item.id,
             input_type: item.input_type,
             input_value: item.input_value,
             created_at: item.created_at,
-            job_id: item.job_id,
-            analysis_status: item.analysis_jobs?.status,
-            bunkd_score: typeof score === 'number' ? score : undefined,
-          };
-        });
+            status: item.status,
+            bs_score: item.bs_score,
+            result_json: item.result_json,
+          }));
         setHistory(items);
       }
     } catch (error) {
-      console.error('Error loading history:', error);
+      console.error('[History] Error loading history:', error);
+      setHistory([]);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -101,29 +93,32 @@ export default function HistoryScreen() {
   };
 
   const handleItemPress = async (item: HistoryItem) => {
-    if (!item.job_id) return;
-
-    // Fetch the full result
-    try {
-      const { data, error } = await supabase
-        .from('analysis_results')
-        .select('result_data')
-        .eq('job_id', item.job_id)
-        .single();
-
-      if (!error && data) {
-        router.push({
-          pathname: '/result',
-          params: {
-            result: JSON.stringify(data.result_data),
-            jobId: item.job_id,
-            cached: 'true',
-          },
-        });
-      }
-    } catch (error) {
-      console.error('Error fetching result:', error);
+    // Only navigate if we have a completed result
+    if (item.status !== 'done' || !item.result_json) {
+      console.log('[History] Item not ready:', item.status);
+      return;
     }
+
+    // Construct input object from history item for share functionality
+    const input: Record<string, string> = {};
+    if (item.input_type === 'url') {
+      input.url = item.input_value;
+    } else if (item.input_type === 'text') {
+      input.text = item.input_value;
+    } else if (item.input_type === 'image') {
+      input.image_url = item.input_value;
+    }
+
+    // Navigate to result screen with the stored result
+    router.push({
+      pathname: '/result',
+      params: {
+        result: JSON.stringify(item.result_json),
+        jobId: item.id,
+        cached: 'true',
+        input: JSON.stringify(input),
+      },
+    });
   };
 
   const truncateText = (text: string, maxLength: number = 60): string => {
@@ -181,7 +176,7 @@ export default function HistoryScreen() {
     <TouchableOpacity
       style={styles.historyItem}
       onPress={() => handleItemPress(item)}
-      disabled={item.analysis_status !== 'done' && item.analysis_status !== 'completed'}
+      disabled={item.status !== 'done'}
     >
       <View style={styles.itemHeader}>
         <View style={styles.itemTypeContainer}>
@@ -193,27 +188,27 @@ export default function HistoryScreen() {
       <Text style={styles.itemValue}>{truncateText(item.input_value)}</Text>
 
       <View style={styles.itemFooter}>
-        {item.analysis_status && (
+        {item.status && (
           <View
             style={[
               styles.statusBadge,
-              { backgroundColor: getStatusColor(item.analysis_status) },
+              { backgroundColor: getStatusColor(item.status) },
             ]}
           >
             <Text style={styles.statusText}>
-              {item.analysis_status.charAt(0).toUpperCase() + item.analysis_status.slice(1)}
+              {item.status.charAt(0).toUpperCase() + item.status.slice(1)}
             </Text>
           </View>
         )}
-        {item.bunkd_score !== undefined && (
+        {item.bs_score !== null && item.bs_score !== undefined && (
           <View style={styles.scoreContainer}>
             <Text
               style={[
                 styles.scoreText,
-                { color: getScoreColor(item.bunkd_score) },
+                { color: getScoreColor(item.bs_score) },
               ]}
             >
-              {item.bunkd_score.toFixed(1)}/10
+              {item.bs_score.toFixed(1)}/10
             </Text>
           </View>
         )}

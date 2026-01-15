@@ -17,6 +17,16 @@ import {
   mapToLegacySubscores,
 } from './scoring-schema';
 
+// Claim archetypes for tiered routing (v2.1)
+import {
+  determineRoutingTier,
+  buildCommodityResult as buildCommodityResultV2,
+  buildArchetypeResult,
+  buildUnableToAssessResult,
+  detectClaimArchetype,
+  RoutingResult,
+} from './claim_archetypes';
+
 // Load environment variables from multiple locations (later sources don't override)
 // Priority: process.env > worker/.env > repo/.env > supabase/.env
 const envPaths = [
@@ -85,6 +95,9 @@ interface Job {
   cache_key: string;
   attempts: number;
   request_id: string;
+  // Disambiguation fields
+  selected_candidate_id?: string;
+  interpreted_as?: string;
 }
 
 interface PerplexityResponse {
@@ -106,11 +119,13 @@ interface PerplexityResponse {
 interface BunkdAnalysisResult {
   version: "bunkd_v1";
   scoring_version?: string; // "2.0" for new schema, optional for legacy fallback
-  bunk_score?: number; // Optional now - may not be set if insufficient data
+  bunk_score?: number; // Now ALWAYS set - we no longer refuse to score
   confidence: number;
-  verdict?: "low" | "elevated" | "high"; // Optional - only set when scoreable
-  unable_to_score?: boolean; // Flag for insufficient data
-  insufficient_data_reason?: string; // Explanation
+  confidence_level?: "low" | "medium" | "high"; // User-friendly confidence label
+  confidence_explanation?: string; // Explanation of confidence level
+  verdict?: "low" | "elevated" | "high"; // Now ALWAYS set - no longer optional
+  unable_to_score?: boolean; // DEPRECATED: kept for backward compat, always false
+  insufficient_data_reason?: string; // DEPRECATED: kept for backward compat
   summary: string;
   evidence_bullets: string[];
   key_claims: Array<{
@@ -145,6 +160,27 @@ interface BunkdAnalysisResult {
     clinical_studies?: string;
   };
   disclaimers?: string[];
+  // For whole_foods_commodity category: what WOULD increase BS if context were provided
+  key_findings_if_context_provided?: string[];
+  // DISAMBIGUATION FIELDS - for ambiguous short queries
+  needs_disambiguation?: boolean;
+  disambiguation_query?: string;
+  disambiguation_candidates?: Array<{
+    id: string;
+    label: string;
+    category_hint: string;
+    confidence: number;
+  }>;
+  // Set after user selects a disambiguation candidate
+  interpreted_as?: string;
+  // ROUTING/ARCHETYPE FIELDS (v2.1)
+  analysis_mode?: 'commodity' | 'claim_archetype' | 'seller_specific' | 'full_analysis' | 'unable_to_assess';
+  claim_archetype?: {
+    name: string;
+    confidence: number;
+    matched_signals: string[];
+  };
+  unable_to_assess?: boolean;
 }
 
 // Initialize Supabase client
@@ -153,6 +189,493 @@ const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROL
 // Sleep utility
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// =============================================================================
+// BARE COMMODITY FAST PATH DETECTOR
+// =============================================================================
+
+/**
+ * Detects if text is a bare commodity name (e.g., "gala apples", "pumpkin seeds")
+ * with no claims, pricing, seller info, or marketing language.
+ *
+ * When matched, these items can skip Perplexity and return BS = 0.0 immediately.
+ */
+interface BareCommodityResult {
+  match: boolean;
+  item?: string;
+}
+
+// Known commodity terms (MVP lexicon - easy to expand)
+const COMMODITY_LEXICON = new Set([
+  // Fruits
+  'apple', 'apples', 'gala apples', 'honeycrisp', 'honeycrisp apples', 'fuji apples',
+  'granny smith', 'banana', 'bananas', 'orange', 'oranges', 'lemon', 'lemons',
+  'lime', 'limes', 'grapefruit', 'grapefruits', 'mango', 'mangoes', 'mangos',
+  'pineapple', 'pineapples', 'strawberry', 'strawberries', 'blueberry', 'blueberries',
+  'raspberry', 'raspberries', 'blackberry', 'blackberries', 'grape', 'grapes',
+  'watermelon', 'cantaloupe', 'honeydew', 'peach', 'peaches', 'plum', 'plums',
+  'pear', 'pears', 'cherry', 'cherries', 'avocado', 'avocados', 'kiwi', 'kiwis',
+
+  // Vegetables
+  'potato', 'potatoes', 'sweet potato', 'sweet potatoes', 'carrot', 'carrots',
+  'onion', 'onions', 'red onion', 'red onions', 'garlic', 'celery', 'broccoli',
+  'cauliflower', 'spinach', 'kale', 'lettuce', 'romaine', 'cabbage', 'cucumber',
+  'cucumbers', 'tomato', 'tomatoes', 'bell pepper', 'bell peppers', 'zucchini',
+  'squash', 'butternut squash', 'acorn squash', 'pumpkin', 'corn', 'green beans',
+  'peas', 'asparagus', 'mushroom', 'mushrooms', 'eggplant', 'beet', 'beets',
+  'radish', 'radishes', 'turnip', 'turnips', 'parsnip', 'parsnips',
+
+  // Nuts & Seeds
+  'almonds', 'almond', 'walnuts', 'walnut', 'pecans', 'pecan', 'cashews', 'cashew',
+  'peanuts', 'peanut', 'pistachios', 'pistachio', 'macadamia', 'hazelnuts', 'hazelnut',
+  'brazil nuts', 'pine nuts', 'sunflower seeds', 'pumpkin seeds', 'chia seeds',
+  'flax seeds', 'flaxseed', 'hemp seeds', 'sesame seeds',
+
+  // Grains & Legumes
+  'rice', 'brown rice', 'white rice', 'jasmine rice', 'basmati rice', 'oats',
+  'oatmeal', 'rolled oats', 'steel cut oats', 'quinoa', 'barley', 'bulgur',
+  'farro', 'millet', 'buckwheat', 'wheat', 'flour', 'bread', 'pasta',
+  'lentils', 'red lentils', 'green lentils', 'chickpeas', 'black beans',
+  'kidney beans', 'pinto beans', 'navy beans', 'beans', 'split peas',
+
+  // Dairy & Eggs
+  'eggs', 'egg', 'milk', 'butter', 'cream', 'cheese', 'yogurt', 'cottage cheese',
+
+  // Basic Staples
+  'salt', 'pepper', 'sugar', 'honey', 'olive oil', 'vegetable oil', 'vinegar',
+  'coffee', 'tea', 'water',
+
+  // Proteins (unprocessed)
+  'chicken', 'beef', 'pork', 'fish', 'salmon', 'tuna', 'shrimp', 'turkey', 'lamb',
+]);
+
+// Commodity term endings for fuzzy matching
+const COMMODITY_SUFFIXES = [
+  'apples', 'apple', 'bananas', 'banana', 'oranges', 'orange',
+  'potatoes', 'potato', 'carrots', 'carrot', 'onions', 'onion',
+  'seeds', 'nuts', 'beans', 'lentils', 'rice', 'oats',
+];
+
+// Marketing/claim tokens that disqualify bare commodity matching
+const MARKETING_TOKENS = [
+  'clinically', 'proven', 'miracle', 'detox', 'cure', 'guarantee', 'guaranteed',
+  'limited', 'sale', 'off', 'free shipping', 'best', 'revolutionary',
+  'fat burn', 'anti-aging', 'anti aging', 'lose', 'boost', 'treat', 'treatment',
+  'weight loss', 'energy', 'immune', 'superfood', 'super food', 'premium',
+  'exclusive', 'secret', 'breakthrough', 'amazing', 'incredible', 'unbelievable',
+];
+
+function isBareCommodityName(text: string): BareCommodityResult {
+  // Normalize: lowercase, trim, collapse whitespace
+  const normalized = text.toLowerCase().trim().replace(/\s+/g, ' ');
+
+  // Reject if empty
+  if (!normalized) {
+    return { match: false };
+  }
+
+  // Reject if contains URL indicators
+  if (/https?:\/\/|www\.|\.com|\.ca|\.org|\.net|\.co\.|\.io/i.test(normalized)) {
+    return { match: false };
+  }
+
+  // Reject if contains digits or currency (prices, quantities with numbers)
+  if (/\d|[$€£¥]|%/.test(normalized)) {
+    return { match: false };
+  }
+
+  // Reject if contains marketing/claim tokens
+  for (const token of MARKETING_TOKENS) {
+    if (normalized.includes(token)) {
+      return { match: false };
+    }
+  }
+
+  // Reject if word count > 5
+  const words = normalized.split(' ');
+  if (words.length > 5) {
+    return { match: false };
+  }
+
+  // Check for non-letter/space/hyphen characters (allow apostrophe for contractions shouldn't exist)
+  if (!/^[a-z\s\-']+$/.test(normalized)) {
+    return { match: false };
+  }
+
+  // Check if exact match in lexicon
+  if (COMMODITY_LEXICON.has(normalized)) {
+    return { match: true, item: normalized };
+  }
+
+  // Check if ends with a known commodity suffix (e.g., "fuji apples", "raw almonds")
+  for (const suffix of COMMODITY_SUFFIXES) {
+    if (normalized.endsWith(suffix) && words.length <= 4) {
+      // Additional check: first word shouldn't be a marketing term
+      const prefix = normalized.replace(suffix, '').trim();
+      if (prefix && !MARKETING_TOKENS.some(t => prefix.includes(t))) {
+        // Basic descriptor allowed: red, green, fresh, raw, whole, sliced
+        const allowedPrefixes = ['red', 'green', 'yellow', 'fresh', 'raw', 'whole', 'sliced',
+                                  'diced', 'frozen', 'dried', 'roasted', 'salted', 'unsalted'];
+        const prefixWords = prefix.split(' ');
+        const allPrefixesAllowed = prefixWords.every(w =>
+          allowedPrefixes.includes(w) || w.length <= 2 // allow very short words like "lg"
+        );
+        if (allPrefixesAllowed || prefix === '') {
+          return { match: true, item: normalized };
+        }
+      }
+    }
+  }
+
+  // Check individual words - if the main noun is a commodity
+  // e.g., "fresh spinach" - "spinach" is in lexicon
+  for (const word of words) {
+    if (COMMODITY_LEXICON.has(word) && words.length <= 3) {
+      // Make sure other words are simple descriptors
+      const otherWords = words.filter(w => w !== word);
+      const simpleDescriptors = ['fresh', 'raw', 'whole', 'sliced', 'diced', 'frozen',
+                                  'dried', 'roasted', 'red', 'green', 'yellow', 'white',
+                                  'brown', 'black', 'wild', 'baby', 'mini', 'large', 'small'];
+      const allSimple = otherWords.every(w => simpleDescriptors.includes(w));
+      if (allSimple) {
+        return { match: true, item: normalized };
+      }
+    }
+  }
+
+  return { match: false };
+}
+
+/**
+ * Build a fast-path response for bare commodity names.
+ * Returns a complete BunkdAnalysisResult with bunk_score = 0.0
+ */
+function buildBareCommodityResult(item: string): BunkdAnalysisResult {
+  return {
+    version: "bunkd_v1",
+    scoring_version: "2.0",
+    bunk_score: 0.0,
+    confidence: 1.0,
+    confidence_level: "high",
+    confidence_explanation: "Item-only query; no seller, claims, or pricing provided, so BS risk is effectively zero.",
+    verdict: "low",
+    unable_to_score: false,
+    summary: `"${item}" is a basic whole food or commodity. Without seller information, pricing, or specific claims to evaluate, there's no BS to detect.`,
+    evidence_bullets: [],
+    key_claims: [],
+    red_flags: [],
+    subscores: {
+      human_evidence: 10,
+      authenticity_transparency: 10,
+      marketing_overclaim: 0,
+      pricing_value: 10,
+    },
+    category: "whole_foods_commodity",
+    category_confidence: 1.0,
+    pillar_scores: {
+      claim_density: 0,
+      claim_specificity: 0,
+      verifiability: 0,
+      evidence_quality: 0,
+      transparency: 0,
+      presentation_risk: 0,
+      source_authority: 0,
+      harm_potential: 0,
+    },
+    score_breakdown: {
+      baseRisk01: 0,
+      harmMultiplier: 1.0,
+      penalties01: 0,
+      credits01: 0,
+      confidenceAdjusted01: 0,
+    },
+    citations: [],
+    key_findings_if_context_provided: [
+      "Seller markup or deceptive unit pricing",
+      "Unverifiable labels like 'organic' without USDA/certifier proof",
+      "Misleading origin claims ('local', 'wild', 'grass-fed') without verification",
+      "Health claims beyond basic nutritional facts",
+    ],
+  };
+}
+
+// =============================================================================
+// AMBIGUOUS QUERY DETECTOR & DISAMBIGUATION
+// =============================================================================
+
+/**
+ * Detects if a text query is ambiguous and needs disambiguation.
+ * Triggers for brand-like short queries (e.g., "JOVS", "Apple", "Prime")
+ * that could mean different things (brand vs commodity, tech vs food, etc.)
+ */
+interface AmbiguityCheckResult {
+  isAmbiguous: boolean;
+  reason?: string;
+}
+
+// Known ambiguous terms that definitely need disambiguation
+const KNOWN_AMBIGUOUS_TERMS = new Set([
+  'apple', 'amazon', 'prime', 'shell', 'dove', 'target', 'oracle',
+  'jaguar', 'puma', 'blackberry', 'virgin', 'delta', 'united',
+  'monster', 'red bull', 'celsius', 'bang', 'ghost',
+]);
+
+function isAmbiguousQuery(text: string): AmbiguityCheckResult {
+  const normalized = text.toLowerCase().trim().replace(/\s+/g, ' ');
+  const words = normalized.split(' ');
+
+  // Only check short queries (1-2 tokens)
+  if (words.length > 2) {
+    return { isAmbiguous: false };
+  }
+
+  // Reject if contains URL/currency/percent (clearly not ambiguous brand query)
+  if (/https?:\/\/|www\.|\.com|\.ca|\.org|\.net|\.io/i.test(normalized)) {
+    return { isAmbiguous: false };
+  }
+  if (/[$€£¥]|%|\d{3,}/.test(normalized)) {
+    return { isAmbiguous: false };
+  }
+
+  // Check for known ambiguous terms
+  if (words.length === 1 && KNOWN_AMBIGUOUS_TERMS.has(normalized)) {
+    return { isAmbiguous: true, reason: 'known_ambiguous_term' };
+  }
+
+  const token = words.join('');
+
+  // ALL CAPS 2-6 characters (brand acronyms like "JOVS", "IBM", "GNC")
+  if (/^[A-Z]{2,6}$/.test(text.trim())) {
+    return { isAmbiguous: true, reason: 'all_caps_acronym' };
+  }
+
+  // Mixed case single token 2-10 chars that looks like a brand (e.g., "iPhone", "TikTok")
+  if (words.length === 1 && token.length >= 2 && token.length <= 10) {
+    // Check for mixed case (has both upper and lower)
+    if (/[a-z]/.test(token) && /[A-Z]/.test(token)) {
+      return { isAmbiguous: true, reason: 'mixed_case_brand' };
+    }
+    // Contains letters + numbers (e.g., "X7", "3M", "V8")
+    if (/[a-zA-Z]/.test(token) && /\d/.test(token)) {
+      return { isAmbiguous: true, reason: 'alphanumeric_brand' };
+    }
+  }
+
+  // Single capitalized word 2-10 chars that's NOT clearly a commodity
+  if (words.length === 1 && /^[A-Z][a-z]{1,9}$/.test(text.trim())) {
+    // Check if it's a clear commodity (already handled by bare commodity detector)
+    const commodityCheck = isBareCommodityName(text);
+    if (!commodityCheck.match) {
+      // Not a commodity, could be a brand name
+      return { isAmbiguous: true, reason: 'proper_noun_single_word' };
+    }
+  }
+
+  return { isAmbiguous: false };
+}
+
+/**
+ * Call Perplexity with a lightweight disambiguation prompt.
+ * Returns up to 5 candidate meanings for the ambiguous query.
+ */
+interface DisambiguationCandidate {
+  id: string;
+  label: string;
+  category_hint: string;
+  confidence: number;
+}
+
+async function getDisambiguationCandidates(
+  query: string
+): Promise<DisambiguationCandidate[]> {
+  const systemMessage = `You are a disambiguation engine. Given a short query, propose up to 5 plausible meanings the user might intend when checking for misleading claims or BS.
+
+For each meaning, provide:
+- id: unique lowercase slug (e.g., "jovs-beauty-device", "apple-fruit", "apple-inc")
+- label: concise human-readable label (e.g., "JOVS Beauty Device", "Apple (fruit)", "Apple Inc.")
+- category_hint: one of [whole_foods_commodity, supplements, beauty_personal_care, tech_gadgets, automotive, business_guru, general]
+- confidence: 0.0-1.0 estimate of how likely this interpretation is
+
+Output JSON only, no explanation. Format:
+{"candidates":[{"id":"...","label":"...","category_hint":"...","confidence":0.0}]}`;
+
+  const userMessage = `Query: "${query}"`;
+
+  try {
+    const response = await fetch('https://api.perplexity.ai/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'sonar', // Use lighter model for disambiguation
+        messages: [
+          { role: 'system', content: systemMessage },
+          { role: 'user', content: userMessage },
+        ],
+        max_tokens: 500, // Small token budget
+        temperature: 0.3,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error(`Disambiguation API error: ${response.status}`);
+      return [];
+    }
+
+    const data = await response.json() as PerplexityResponse;
+    const content = data.choices[0]?.message?.content || '';
+
+    // Parse JSON from response
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.error('No JSON found in disambiguation response');
+      return [];
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const candidates = parsed.candidates || [];
+
+    // Validate and normalize candidates
+    return candidates
+      .filter((c: any) => c.id && c.label && c.category_hint)
+      .map((c: any) => ({
+        id: String(c.id).toLowerCase().replace(/\s+/g, '-'),
+        label: String(c.label),
+        category_hint: String(c.category_hint),
+        confidence: Math.max(0, Math.min(1, Number(c.confidence) || 0.5)),
+      }))
+      .sort((a: DisambiguationCandidate, b: DisambiguationCandidate) =>
+        b.confidence - a.confidence
+      )
+      .slice(0, 5);
+
+  } catch (error: any) {
+    console.error('Disambiguation call failed:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Build a disambiguation response (no scoring yet).
+ * Returns a partial result that signals the client to show a picker.
+ */
+function buildDisambiguationResult(
+  query: string,
+  candidates: DisambiguationCandidate[]
+): BunkdAnalysisResult {
+  return {
+    version: "bunkd_v1",
+    scoring_version: "2.0",
+    confidence: 0.3, // Low confidence since we don't know what they mean
+    confidence_level: "low",
+    confidence_explanation: "Query is ambiguous - please select the intended meaning.",
+    summary: `The query "${query}" could refer to multiple things. Please select the intended meaning to get an accurate BS score.`,
+    evidence_bullets: [],
+    key_claims: [],
+    red_flags: [],
+    subscores: {
+      human_evidence: 0,
+      authenticity_transparency: 0,
+      marketing_overclaim: 0,
+      pricing_value: 0,
+    },
+    citations: [],
+    // Disambiguation fields
+    needs_disambiguation: true,
+    disambiguation_query: query,
+    disambiguation_candidates: candidates,
+  };
+}
+
+// =============================================================================
+// DISAMBIGUATION CACHE (Supabase-based, 48h TTL)
+// =============================================================================
+
+interface DisambiguationCacheEntry {
+  query: string;
+  candidates: DisambiguationCandidate[];
+  created_at: string;
+}
+
+// In-memory cache for current session (backed by Supabase for persistence)
+const disambiguationCache = new Map<string, DisambiguationCacheEntry>();
+const DISAMBIGUATION_CACHE_TTL_MS = 48 * 60 * 60 * 1000; // 48 hours
+
+function getDisambiguationCacheKey(query: string): string {
+  return `disambig:${query.toLowerCase().trim()}`;
+}
+
+async function getCachedDisambiguation(query: string): Promise<DisambiguationCandidate[] | null> {
+  const cacheKey = getDisambiguationCacheKey(query);
+
+  // Check in-memory first
+  const memCached = disambiguationCache.get(cacheKey);
+  if (memCached) {
+    const age = Date.now() - new Date(memCached.created_at).getTime();
+    if (age < DISAMBIGUATION_CACHE_TTL_MS) {
+      console.log(`  📦 Disambiguation cache hit (memory): "${query}"`);
+      return memCached.candidates;
+    }
+  }
+
+  // Check Supabase
+  try {
+    const { data, error } = await supabase
+      .from('disambiguation_cache')
+      .select('candidates, created_at')
+      .eq('cache_key', cacheKey)
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    const age = Date.now() - new Date(data.created_at).getTime();
+    if (age >= DISAMBIGUATION_CACHE_TTL_MS) {
+      return null;
+    }
+
+    // Populate in-memory cache
+    disambiguationCache.set(cacheKey, {
+      query,
+      candidates: data.candidates,
+      created_at: data.created_at,
+    });
+
+    console.log(`  📦 Disambiguation cache hit (db): "${query}"`);
+    return data.candidates;
+  } catch {
+    return null;
+  }
+}
+
+async function cacheDisambiguation(query: string, candidates: DisambiguationCandidate[]): Promise<void> {
+  const cacheKey = getDisambiguationCacheKey(query);
+  const now = new Date().toISOString();
+
+  // Update in-memory
+  disambiguationCache.set(cacheKey, {
+    query,
+    candidates,
+    created_at: now,
+  });
+
+  // Persist to Supabase (upsert)
+  try {
+    await supabase
+      .from('disambiguation_cache')
+      .upsert({
+        cache_key: cacheKey,
+        query: query.toLowerCase().trim(),
+        candidates,
+        created_at: now,
+      }, { onConflict: 'cache_key' });
+  } catch (error: any) {
+    console.warn(`Failed to cache disambiguation: ${error.message}`);
+  }
 }
 
 // Fetch and extract text content from a URL
@@ -970,24 +1493,20 @@ function scoreWithPack(
     extractEvidenceBullets(perplexityResponse)
   );
 
-  // Determine if we can score based on confidence
-  const unableToScore = confidence < 0.5;
-  const insufficientReason = unableToScore
-    ? `Confidence too low (${(confidence * 100).toFixed(0)}%) - insufficient evidence to provide a reliable score`
-    : undefined;
-
-  // Compute verdict
+  // ALWAYS compute and return a score - never refuse to score
+  // Low confidence just means we add disclaimers, not that we refuse
   const verdict = verdictFromScore(bunkScore);
 
   return {
-    bunkScore: unableToScore ? 0 : bunkScore,
+    bunkScore, // Always return actual score
     pillarScores,
     confidence,
     redFlags: allRedFlags,
     autoFailReasons: triggeredRules,
-    verdict: unableToScore ? 'elevated' : verdict,
-    unableToScore,
-    insufficientReason,
+    verdict,
+    // DEPRECATED: kept for backward compat, always false now
+    unableToScore: false,
+    insufficientReason: undefined,
   };
 }
 
@@ -1673,10 +2192,18 @@ function extractStructuredData(
   ].slice(0, 7);
 
   // ========================================================================
-  // CONFIDENCE GATING (using new shrinkToMidpoint approach)
+  // CONFIDENCE HANDLING - ALWAYS return a score with confidence label
   // ========================================================================
-  const confidence = scoreResult.category.confidence;
-  const unableToScore = confidence < 0.5;
+  // Use category confidence for overall confidence (this is what scoreBSMeter uses)
+  const categoryConfidence = scoreResult.category.confidence;
+
+  // Compute confidence level and explanation
+  const confidenceLevel = toConfidenceLevel(categoryConfidence);
+  const confExplanation = confidenceExplanation(confidenceLevel);
+
+  // ALWAYS compute score and verdict - never refuse to score
+  const bunkScore = scoreResult.finalScore10;
+  const verdict = getVerdictFromScore(bunkScore);
 
   const result: BunkdAnalysisResult = {
     version: 'bunkd_v1',
@@ -1702,22 +2229,26 @@ function extractStructuredData(
       name: 'Extracted from analysis',
       clinical_studies: evidenceBullets.some(b => /study|trial/i.test(b)) ? 'Referenced in analysis' : 'Not found',
     },
-    confidence,
+    // ALWAYS set score and verdict
+    bunk_score: bunkScore,
+    verdict: verdict,
+    // Confidence fields
+    confidence: categoryConfidence,
+    confidence_level: confidenceLevel,
+    confidence_explanation: confExplanation,
+    // DEPRECATED: kept for backward compat, always false now
+    unable_to_score: false,
   };
 
-  if (unableToScore) {
-    result.unable_to_score = true;
-    result.insufficient_data_reason = `Confidence too low (${(confidence * 100).toFixed(0)}%) - insufficient evidence to provide a reliable score`;
-    console.log(`    ⚠️  Unable to score: ${result.insufficient_data_reason}`);
-  } else if (confidence < 0.7) {
-    result.bunk_score = scoreResult.finalScore10;
-    result.verdict = getVerdictFromScore(scoreResult.finalScore10);
-    result.disclaimers = ['Score based on limited evidence - treat as preliminary assessment'];
-    console.log(`    ⚠️  Limited confidence score: ${scoreResult.finalScore10} (${result.verdict})`);
+  // Add disclaimers for low/medium confidence
+  if (confidenceLevel === 'low') {
+    result.disclaimers = ['Limited evidence available - treat as a rough estimate'];
+    console.log(`    ⚠️  Low confidence score: ${bunkScore} (${verdict}) - ${confExplanation}`);
+  } else if (confidenceLevel === 'medium') {
+    result.disclaimers = ['Score based on partial evidence - treat as preliminary assessment'];
+    console.log(`    ⚠️  Medium confidence score: ${bunkScore} (${verdict}) - ${confExplanation}`);
   } else {
-    result.bunk_score = scoreResult.finalScore10;
-    result.verdict = getVerdictFromScore(scoreResult.finalScore10);
-    console.log(`    ✓ High confidence score: ${scoreResult.finalScore10} (${result.verdict})`);
+    console.log(`    ✓ High confidence score: ${bunkScore} (${verdict}) - ${confExplanation}`);
   }
 
   return result;
@@ -1729,6 +2260,20 @@ function getVerdictFromScore(score: number): "low" | "elevated" | "high" {
   if (score <= interpretation.low.range[1]) return "low";
   if (score <= interpretation.mid.range[1]) return "elevated";
   return "high";
+}
+
+// Helper to convert numeric confidence to a user-friendly level
+function toConfidenceLevel(conf: number): "low" | "medium" | "high" {
+  if (conf >= 0.75) return "high";
+  if (conf >= 0.5) return "medium";
+  return "low";
+}
+
+// Helper to provide explanation text for confidence level
+function confidenceExplanation(level: "low" | "medium" | "high"): string {
+  if (level === "high") return "Strong evidence coverage across sources.";
+  if (level === "medium") return "Some signals missing; treat as an estimate.";
+  return "Limited evidence or unclear category; treat as a rough estimate.";
 }
 
 // Legacy function for backward compatibility - now wraps two-phase approach
@@ -2036,47 +2581,47 @@ function parseAndValidateResponse(rawContent: string, pageContentLength?: number
       redFlags.push('Limited citations returned; treat evidence strength cautiously.');
     }
 
-    // Step 5: Build final result
-    let finalResult: BunkdAnalysisResult;
-
+    // Step 5: Build final result - ALWAYS compute and return a score
+    // Adjust confidence if insufficient data was detected
     if (insufficientDataCheck.insufficient) {
-      // Insufficient data - don't compute score
-      console.log(`  ⚠️  Insufficient data detected: ${insufficientDataCheck.reason}`);
-
-      finalResult = {
-        version: 'bunkd_v1',
-        unable_to_score: true,
-        insufficient_data_reason: insufficientDataCheck.reason,
-        confidence: 0.3, // Low confidence
-        summary: parseResult.result.summary,
-        evidence_bullets: parseResult.result.evidence_bullets,
-        subscores: parseResult.result.subscores,
-        key_claims: parseResult.result.key_claims,
-        red_flags: redFlags,
-        citations: parseResult.result.citations,
-        product_details: parseResult.result.product_details,
-        disclaimers: parseResult.result.disclaimers,
-      };
-    } else {
-      // Sufficient data - compute score normally
-      const computedScore = computeBunkScore(parseResult.result.subscores);
-      const computedVerdict = verdictFromScore(computedScore);
-
-      finalResult = {
-        version: 'bunkd_v1',
-        bunk_score: computedScore,
-        confidence: confidence,
-        verdict: computedVerdict,
-        summary: parseResult.result.summary,
-        evidence_bullets: parseResult.result.evidence_bullets,
-        subscores: parseResult.result.subscores,
-        key_claims: parseResult.result.key_claims,
-        red_flags: redFlags,
-        citations: parseResult.result.citations,
-        product_details: parseResult.result.product_details,
-        disclaimers: parseResult.result.disclaimers,
-      };
+      confidence = Math.min(confidence, 0.4); // Lower confidence but still score
+      console.log(`  ⚠️  Limited data detected: ${insufficientDataCheck.reason} - scoring with low confidence`);
     }
+
+    // ALWAYS compute score and verdict
+    const computedScore = computeBunkScore(parseResult.result.subscores);
+    const computedVerdict = verdictFromScore(computedScore);
+
+    // Compute confidence level and explanation
+    const confidenceLevel = toConfidenceLevel(confidence);
+    const confExplanation = confidenceExplanation(confidenceLevel);
+
+    // Build disclaimers based on confidence level
+    let disclaimers = parseResult.result.disclaimers || [];
+    if (confidenceLevel === 'low') {
+      disclaimers = [...disclaimers, 'Limited evidence available - treat as a rough estimate'];
+    } else if (confidenceLevel === 'medium') {
+      disclaimers = [...disclaimers, 'Score based on partial evidence - treat as preliminary assessment'];
+    }
+
+    const finalResult: BunkdAnalysisResult = {
+      version: 'bunkd_v1',
+      bunk_score: computedScore,
+      confidence: confidence,
+      confidence_level: confidenceLevel,
+      confidence_explanation: confExplanation,
+      verdict: computedVerdict,
+      // DEPRECATED: kept for backward compat, always false now
+      unable_to_score: false,
+      summary: parseResult.result.summary,
+      evidence_bullets: parseResult.result.evidence_bullets,
+      subscores: parseResult.result.subscores,
+      key_claims: parseResult.result.key_claims,
+      red_flags: redFlags,
+      citations: parseResult.result.citations,
+      product_details: parseResult.result.product_details,
+      disclaimers: disclaimers.length > 0 ? disclaimers : undefined,
+    };
 
     return {
       valid: true,
@@ -2123,6 +2668,206 @@ async function processJob(job: Job): Promise<void> {
         console.warn(`  ⚠️  Failed to fetch page: ${fetchResult.error}`);
         console.log(`  Continuing with Perplexity-only research...`);
       }
+    }
+
+    // =================================================================
+    // TIERED ROUTING: Determine analysis path based on input type/content
+    // =================================================================
+    let hasDisambiguationFailed = false;
+
+    // For text inputs, check if user already selected a disambiguation candidate
+    if (job.input_type === 'text' && job.selected_candidate_id) {
+      console.log(`  ✓ Using selected interpretation: "${job.interpreted_as || job.selected_candidate_id}"`);
+    }
+
+    // Determine routing tier
+    const routing = determineRoutingTier(
+      job.input_type as 'url' | 'text' | 'image',
+      job.normalized_input,
+      hasDisambiguationFailed
+    );
+    console.log(`  🎯 ROUTING: Tier ${routing.tier} (${routing.mode}) - ${routing.reason}`);
+
+    // -------------------------------------------------------------------------
+    // TIER 1: Commodity - Instant zero BS score
+    // -------------------------------------------------------------------------
+    if (routing.tier === 1 && routing.commodity) {
+      console.log(`  🥬 TIER 1: Bare commodity detected: "${routing.commodity}"`);
+      console.log(`  ✓ Skipping Perplexity - returning BS Meter = 0.0`);
+
+      const result = buildCommodityResultV2(routing.commodity);
+
+      const { error: updateError } = await supabase
+        .from('analysis_jobs')
+        .update({
+          status: 'done',
+          bs_score: result.bunk_score,
+          result_json: result,
+          model_used: 'tier1-commodity',
+          perplexity_latency_ms: 0,
+        })
+        .eq('id', job.id);
+
+      if (updateError) {
+        console.error(`  ❌ Failed to update job:`, updateError);
+        throw updateError;
+      }
+
+      console.log(`  ✓ Job completed (Tier 1 commodity)`);
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // TIER 2: Scam Archetype - Instant high BS score
+    // -------------------------------------------------------------------------
+    if (routing.tier === 2 && routing.archetypeMatch) {
+      const { archetype, confidence, matchedSignals } = routing.archetypeMatch;
+      console.log(`  🚨 TIER 2: Scam archetype detected: "${archetype.name}"`);
+      console.log(`    Confidence: ${Math.round(confidence * 100)}%`);
+      console.log(`    Matched signals: ${matchedSignals.join(', ')}`);
+      console.log(`  ✓ Skipping Perplexity - returning high BS score`);
+
+      const result = buildArchetypeResult(routing.archetypeMatch, job.normalized_input);
+
+      const { error: updateError } = await supabase
+        .from('analysis_jobs')
+        .update({
+          status: 'done',
+          bs_score: result.bunk_score,
+          result_json: result,
+          model_used: 'tier2-archetype',
+          perplexity_latency_ms: 0,
+        })
+        .eq('id', job.id);
+
+      if (updateError) {
+        console.error(`  ❌ Failed to update job:`, updateError);
+        throw updateError;
+      }
+
+      console.log(`  ✓ Job completed (Tier 2 archetype: ${archetype.name}, score: ${result.bunk_score})`);
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // TIER 3: Full Analysis - But first check for disambiguation (text only)
+    // -------------------------------------------------------------------------
+    if (routing.tier === 3 && job.input_type === 'text' && !job.selected_candidate_id) {
+      const ambiguityCheck = isAmbiguousQuery(job.normalized_input);
+      if (ambiguityCheck.isAmbiguous) {
+        console.log(`  🔀 DISAMBIGUATION: Ambiguous query detected: "${job.normalized_input}" (${ambiguityCheck.reason})`);
+
+        // Check cache first
+        let candidates = await getCachedDisambiguation(job.normalized_input);
+
+        if (!candidates || candidates.length === 0) {
+          console.log(`  📡 Fetching disambiguation candidates from Perplexity...`);
+          candidates = await getDisambiguationCandidates(job.normalized_input);
+
+          if (candidates.length > 0) {
+            await cacheDisambiguation(job.normalized_input, candidates);
+            console.log(`  ✓ Cached ${candidates.length} disambiguation candidates`);
+          }
+        }
+
+        if (candidates && candidates.length > 0) {
+          const result = buildDisambiguationResult(job.normalized_input, candidates);
+
+          const { error: updateError } = await supabase
+            .from('analysis_jobs')
+            .update({
+              status: 'done',
+              bs_score: null,
+              result_json: result,
+              model_used: 'disambiguation',
+              perplexity_latency_ms: 0,
+            })
+            .eq('id', job.id);
+
+          if (updateError) {
+            console.error(`  ❌ Failed to update job:`, updateError);
+            throw updateError;
+          }
+
+          console.log(`  ✓ Job completed (needs disambiguation - ${candidates.length} candidates)`);
+          return;
+        } else {
+          // No disambiguation candidates found - re-route with disambiguation failed flag
+          console.log(`  ⚠️ No disambiguation candidates found, re-checking routing...`);
+          hasDisambiguationFailed = true;
+
+          const reRouting = determineRoutingTier(
+            job.input_type as 'url' | 'text' | 'image',
+            job.normalized_input,
+            hasDisambiguationFailed
+          );
+
+          // If now Tier 4, return unable-to-assess
+          if (reRouting.tier === 4) {
+            console.log(`  ❓ TIER 4: Unable to assess - insufficient context`);
+            const result = buildUnableToAssessResult();
+
+            const { error: updateError } = await supabase
+              .from('analysis_jobs')
+              .update({
+                status: 'done',
+                bs_score: null,
+                result_json: result,
+                model_used: 'tier4-unable-to-assess',
+                perplexity_latency_ms: 0,
+              })
+              .eq('id', job.id);
+
+            if (updateError) {
+              console.error(`  ❌ Failed to update job:`, updateError);
+              throw updateError;
+            }
+
+            console.log(`  ✓ Job completed (Tier 4 unable to assess)`);
+            return;
+          }
+
+          // Otherwise continue with full analysis
+          console.log(`  Proceeding with full analysis (Tier 3)`);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // TIER 4: Unable to Assess (direct route without disambiguation attempt)
+    // -------------------------------------------------------------------------
+    if (routing.tier === 4) {
+      console.log(`  ❓ TIER 4: Unable to assess - ${routing.reason}`);
+      const result = buildUnableToAssessResult();
+
+      const { error: updateError } = await supabase
+        .from('analysis_jobs')
+        .update({
+          status: 'done',
+          bs_score: null,
+          result_json: result,
+          model_used: 'tier4-unable-to-assess',
+          perplexity_latency_ms: 0,
+        })
+        .eq('id', job.id);
+
+      if (updateError) {
+        console.error(`  ❌ Failed to update job:`, updateError);
+        throw updateError;
+      }
+
+      console.log(`  ✓ Job completed (Tier 4 unable to assess)`);
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // TIER 3: Full Perplexity Analysis (continue below)
+    // -------------------------------------------------------------------------
+    console.log(`  📊 TIER 3: Proceeding with full Perplexity analysis...`);
+
+    // If we detected an archetype with lower confidence, log it for context
+    if (routing.archetypeMatch) {
+      console.log(`    (Archetype hint: "${routing.archetypeMatch.archetype.name}" at ${Math.round(routing.archetypeMatch.confidence * 100)}% confidence)`);
     }
 
     // =================================================================
@@ -2173,11 +2918,67 @@ async function processJob(job: Job): Promise<void> {
     console.log(`  ✓ Subscores computed: HE=${result.subscores.human_evidence}, AT=${result.subscores.authenticity_transparency}, MO=${result.subscores.marketing_overclaim}, PV=${result.subscores.pricing_value}`);
     console.log(`  ✓ Extracted: ${result.key_claims.length} claims, ${result.red_flags.length} red flags, ${result.evidence_bullets.length} evidence points`);
 
-    // Log score result based on confidence gating
-    if (result.unable_to_score) {
-      console.log(`  ⚠️ Unable to score: ${result.insufficient_data_reason}`);
-    } else {
-      console.log(`  ✓ Computed Bunk Score: ${result.bunk_score} | Verdict: ${result.verdict} | Confidence: ${(result.confidence * 100).toFixed(0)}%`);
+    // =================================================================
+    // PHASE 3: Post-Perplexity Archetype Detection & Score Boost
+    // =================================================================
+    // Run archetype detection on the research content (not the URL)
+    // This catches scam patterns that the base scoring might underweight
+    const postArchetypeMatch = detectClaimArchetype(researchContent + '\n' + (pageContent || ''));
+
+    if (postArchetypeMatch && postArchetypeMatch.confidence >= 0.70) {
+      const { archetype, confidence, matchedSignals } = postArchetypeMatch;
+      const archetypeMinScore = archetype.bsRange.min;
+
+      console.log(`  🎯 POST-PERPLEXITY ARCHETYPE DETECTED: "${archetype.name}"`);
+      console.log(`     Confidence: ${Math.round(confidence * 100)}%`);
+      console.log(`     Matched signals: ${matchedSignals.slice(0, 5).join(', ')}${matchedSignals.length > 5 ? '...' : ''}`);
+      console.log(`     Archetype score range: ${archetype.bsRange.min} - ${archetype.bsRange.max}`);
+
+      // Check if archetype minimum score is higher than current score
+      const currentScore = result.bunk_score ?? 0;
+      if (archetypeMinScore > currentScore) {
+        const originalScore = currentScore;
+        // Boost to archetype minimum + small bump based on confidence
+        const confidenceBoost = (confidence - 0.70) * 2; // 0-0.6 based on confidence 0.70-1.0
+        const boostedScore = Math.min(
+          archetype.bsRange.max,
+          archetypeMinScore + confidenceBoost
+        );
+        result.bunk_score = Math.round(boostedScore * 10) / 10;
+
+        console.log(`  ⚡ ARCHETYPE BOOST APPLIED: "${archetype.name}" raised score from ${originalScore} to ${result.bunk_score}`);
+
+        // Update verdict based on new score
+        result.verdict = result.bunk_score >= 6.5 ? 'high' : result.bunk_score > 3.5 ? 'elevated' : 'low';
+
+        // Add archetype info to result
+        result.analysis_mode = 'claim_archetype';
+        result.claim_archetype = {
+          name: archetype.name,
+          confidence,
+          matched_signals: matchedSignals,
+        };
+
+        // Merge archetype red flags with existing ones (avoid duplicates)
+        const archetypeRedFlags = archetype.redFlagsTemplate.filter(
+          flag => !result.red_flags.some(existing => existing.toLowerCase().includes(flag.toLowerCase().substring(0, 20)))
+        );
+        result.red_flags = [...result.red_flags, ...archetypeRedFlags].slice(0, 8);
+
+        // Update summary to mention archetype
+        if (!result.summary.includes(archetype.name)) {
+          result.summary = `[${archetype.name} pattern detected] ${result.summary}`;
+        }
+      } else {
+        console.log(`  ℹ️ Archetype detected but score already adequate (${currentScore} >= ${archetypeMinScore})`);
+      }
+    }
+
+    // Log final score result with confidence level
+    const confidenceIcon = result.confidence_level === 'high' ? '✓' : '⚠️';
+    console.log(`  ${confidenceIcon} Final Bunk Score: ${result.bunk_score} | Verdict: ${result.verdict} | Confidence: ${result.confidence_level} (${(result.confidence * 100).toFixed(0)}%)`);
+    if (result.confidence_level !== 'high') {
+      console.log(`     ${result.confidence_explanation}`);
     }
 
     // Update job to done

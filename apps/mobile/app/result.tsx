@@ -56,6 +56,9 @@ export default function ResultScreen() {
     ? JSON.parse(params.input as string)
     : null;
 
+  console.log('[Result] params.input:', params.input);
+  console.log('[Result] originalInput:', originalInput);
+
   // Handle re-analyze
   const handleReanalyze = async () => {
     if (!originalInput) {
@@ -206,6 +209,7 @@ export default function ResultScreen() {
   const redFlags = data.red_flags || [];
   const keyClaims = data.key_claims || [];
   const citations = data.citations || [];
+  const interpretedAs = data.interpreted_as || null;
 
   // Render breakdown tab
   const renderBreakdownTab = () => {
@@ -521,12 +525,16 @@ export default function ResultScreen() {
               </TouchableOpacity>
             )}
             <TouchableOpacity
-              onPress={() =>
+              onPress={() => {
+                console.log('[Result] Navigating to share with originalInput:', originalInput);
                 router.push({
                   pathname: '/share',
-                  params: { result: JSON.stringify(result) },
-                })
-              }
+                  params: {
+                    result: JSON.stringify(result),
+                    input: originalInput ? JSON.stringify(originalInput) : undefined,
+                  },
+                });
+              }}
               style={styles.shareButton}
             >
               <Text style={styles.shareButtonText}>Share</Text>
@@ -560,6 +568,9 @@ export default function ResultScreen() {
                 </Text>
               </View>
               <Text style={[styles.scoreTier, { color: scoreColor }]}>{scoreTier}</Text>
+              {interpretedAs && (
+                <Text style={styles.interpretedAs}>Interpreted as: {interpretedAs}</Text>
+              )}
             </View>
           )}
         </View>
@@ -712,6 +723,12 @@ const styles = StyleSheet.create({
   scoreTier: {
     fontSize: 20,
     fontWeight: '600',
+  },
+  interpretedAs: {
+    fontSize: 14,
+    color: '#9ca3af', // Gray-400
+    marginTop: 8,
+    fontStyle: 'italic',
   },
   section: {
     backgroundColor: '#111827', // Dark card background (gray-900)

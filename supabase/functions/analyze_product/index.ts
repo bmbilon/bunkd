@@ -6,6 +6,35 @@ function generateRequestId(): string {
   return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
+// Extract user_id from JWT token in Authorization header
+function extractUserIdFromJWT(authHeader: string | null): string | null {
+  if (!authHeader) return null;
+
+  try {
+    // Remove "Bearer " prefix
+    const token = authHeader.replace(/^Bearer\s+/i, '');
+    if (!token) return null;
+
+    // JWT has 3 parts: header.payload.signature
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    // Decode the payload (middle part)
+    const payload = parts[1];
+    // Base64URL decode
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - base64.length % 4) % 4);
+    const decoded = atob(padded);
+    const parsed = JSON.parse(decoded);
+
+    // The 'sub' claim contains the user_id
+    return parsed.sub || null;
+  } catch (error) {
+    console.log('[extractUserIdFromJWT] Failed to extract user_id:', error);
+    return null;
+  }
+}
+
 // Normalize input for consistent caching
 function normalizeInput(type: string, value: string): string {
   const trimmed = value.trim();
@@ -46,6 +75,12 @@ Deno.serve(async (req) => {
 
   console.log(`[${requestId}] ========== ANALYZE_PRODUCT INGRESS ==========`);
 
+  // TODO: Re-enable user_id extraction once schema cache is updated
+  // Extract user_id from JWT token (for history feature)
+  // const authHeader = req.headers.get('Authorization');
+  // const userId = extractUserIdFromJWT(authHeader);
+  // console.log(`[${requestId}] User ID: ${userId || '(anonymous)'}`);
+
   try {
     // Parse input
     let body: any;
@@ -66,6 +101,10 @@ Deno.serve(async (req) => {
     const text = body.text || body.content;
     const imageUrl = body.image_url || body.imageUrl;
     const forceRefresh = body.force_refresh === true;
+
+    // Disambiguation fields - when user selects from picker
+    const selectedCandidateId = body.selected_candidate_id;
+    const interpretedAs = body.interpreted_as;
 
     // Determine input type and value
     let inputType: string;
@@ -96,12 +135,17 @@ Deno.serve(async (req) => {
     // Normalize input
     const normalizedInput = normalizeInput(inputType, inputValue);
 
-    // Compute cache key (add timestamp suffix if force_refresh to ensure new job)
-    let cacheKey = await computeCacheKey(inputType, normalizedInput);
+    // Compute cache key
+    // Include selected_candidate_id in cache key if provided (disambiguation-resolved query)
+    let cacheKeyInput = normalizedInput;
+    if (selectedCandidateId) {
+      cacheKeyInput = `${normalizedInput}:resolved:${selectedCandidateId}`;
+    }
+    let cacheKey = await computeCacheKey(inputType, cacheKeyInput);
     if (forceRefresh) {
       cacheKey = `${cacheKey}_${Date.now()}`;
     }
-    console.log(`[${requestId}] Cache key: ${cacheKey.substring(0, 16)}...${forceRefresh ? ' (force refresh)' : ''}`);
+    console.log(`[${requestId}] Cache key: ${cacheKey.substring(0, 16)}...${forceRefresh ? ' (force refresh)' : ''}${selectedCandidateId ? ` (disambiguation: ${selectedCandidateId})` : ''}`);
 
     // Create Supabase client with service role (no JWT required)
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -151,18 +195,35 @@ Deno.serve(async (req) => {
 
     console.log(`[${requestId}] ${forceRefresh ? 'Force refresh' : 'Cache miss'} - enqueuing new job`);
 
+    // Build job data
+    const jobData: Record<string, any> = {
+      status: "queued",
+      input_type: inputType,
+      input_value: inputValue,
+      normalized_input: normalizedInput,
+      cache_key: cacheKey,
+      attempts: 0,
+      request_id: requestId,
+    };
+
+    // TODO: Re-enable user_id once schema cache is updated
+    // Add user_id if available (enables history feature)
+    // if (userId) {
+    //   jobData.user_id = userId;
+    // }
+
+    // Add disambiguation fields if provided
+    if (selectedCandidateId) {
+      jobData.selected_candidate_id = selectedCandidateId;
+    }
+    if (interpretedAs) {
+      jobData.interpreted_as = interpretedAs;
+    }
+
     // Enqueue new job
     const { data: newJob, error: insertError } = await supabase
       .from("analysis_jobs")
-      .insert({
-        status: "queued",
-        input_type: inputType,
-        input_value: inputValue,
-        normalized_input: normalizedInput,
-        cache_key: cacheKey,
-        attempts: 0,
-        request_id: requestId,
-      })
+      .insert(jobData)
       .select("id, job_token")
       .single();
 
