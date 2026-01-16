@@ -472,6 +472,15 @@ function isAmbiguousQuery(text: string): AmbiguityCheckResult {
     }
   }
 
+  // All-lowercase single word 4-12 chars that's NOT a commodity (e.g., "minoxidil", "retinol")
+  // This catches drug names, supplement names, and product names typed in lowercase
+  if (words.length === 1 && /^[a-z]{4,12}$/.test(token)) {
+    const commodityCheck = isBareCommodityName(text);
+    if (!commodityCheck.match) {
+      return { isAmbiguous: true, reason: 'lowercase_single_word' };
+    }
+  }
+
   return { isAmbiguous: false };
 }
 
