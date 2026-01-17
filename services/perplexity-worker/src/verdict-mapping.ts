@@ -391,6 +391,10 @@ export function stripMarkdown(text: string): string {
     .replace(/\*\*([^*]+)\*\*/g, '$1')  // **bold** → bold
     .replace(/\*([^*]+)\*/g, '$1')       // *italic* → italic
     .replace(/`([^`]+)`/g, '$1')         // `code` → code
+    .replace(/^\*\*\s*/g, '')            // Remove orphaned ** at start
+    .replace(/\s*\*\*$/g, '')            // Remove orphaned ** at end
+    .replace(/^\*\s*/g, '')              // Remove orphaned * at start
+    .replace(/\s*\*$/g, '')              // Remove orphaned * at end
     .replace(/^\s*[-•]\s*/gm, '')        // Remove bullet prefixes
     .trim();
 }

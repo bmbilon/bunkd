@@ -384,7 +384,11 @@ export default function AnalyzeScreen() {
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-      <ScrollView style={styles.container} keyboardShouldPersistTaps="handled">
+      <ScrollView
+        style={styles.container}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+      >
         {/* Disambiguation Modal */}
         <Modal
           visible={showDisambiguation}
