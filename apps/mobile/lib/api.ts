@@ -90,6 +90,9 @@ export interface AnalysisResult {
   version?: string;
   confidence?: number;
   verdict?: string;
+  verdict_label?: string;
+  verdict_text?: string;
+  meter_label?: string;
   evidence_bullets?: string[];
   key_claims?: Array<{
     claim: string;
@@ -127,6 +130,9 @@ export interface BunkdAnalysisResult {
   confidence_level?: 'low' | 'medium' | 'high';
   confidence_explanation?: string;
   verdict?: 'low' | 'elevated' | 'high';
+  verdict_label?: string;
+  verdict_text?: string;
+  meter_label?: string;
   summary: string;
   evidence_bullets: string[];
   key_claims: Array<{

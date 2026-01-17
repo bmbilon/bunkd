@@ -27,6 +27,14 @@ import {
   RoutingResult,
 } from './claim_archetypes';
 
+// Verdict-score alignment system
+import {
+  getVerdictFields,
+  sanitizeSummary,
+  sanitizeContentText,
+  deduplicateRedFlags,
+} from './verdict-mapping';
+
 // Load environment variables from multiple locations (later sources don't override)
 // Priority: process.env > worker/.env > repo/.env > supabase/.env
 const envPaths = [
@@ -124,6 +132,10 @@ interface BunkdAnalysisResult {
   confidence_level?: "low" | "medium" | "high"; // User-friendly confidence label
   confidence_explanation?: string; // Explanation of confidence level
   verdict?: "low" | "elevated" | "high"; // Now ALWAYS set - no longer optional
+  verdict_label?: string; // Human-readable verdict label (e.g., "Well Supported", "Questionable")
+  secondary_verdict?: string; // Secondary verdict subline for additional context
+  verdict_text?: string;  // Longer verdict explanation
+  meter_label?: string;   // Label for BS Meter display (e.g., "Low BS", "High BS")
   unable_to_score?: boolean; // DEPRECATED: kept for backward compat, always false
   insufficient_data_reason?: string; // DEPRECATED: kept for backward compat
   summary: string;
@@ -134,6 +146,16 @@ interface BunkdAnalysisResult {
     why: string;
   }>;
   red_flags: string[];
+  // Phase 3 UX Polish: structured risk signals with severity
+  risk_signals?: Array<{
+    text: string;
+    severity: number; // 1-4 scale (1=minor, 4=critical)
+  }>;
+  // Phase 3 UX Polish: claims summary for quick overview
+  claims_summary?: {
+    claims: string[];
+    status: string; // e.g., "2 supported, 1 weak, 1 unsupported"
+  };
   subscores: { // LEGACY - kept for backward compat with mobile app
     human_evidence: number;
     authenticity_transparency: number;
@@ -266,12 +288,32 @@ const MARKETING_TOKENS = [
   'exclusive', 'secret', 'breakthrough', 'amazing', 'incredible', 'unbelievable',
 ];
 
+// Commodity terms that are also commonly brand names - skip commodity fast-path
+const AMBIGUOUS_COMMODITY_TERMS = new Set([
+  'apple', 'apples',            // Apple Inc
+  'blackberry', 'blackberries', // BlackBerry phones
+  'orange', 'oranges',          // Orange telecom
+  'dove',                       // Dove soap/beauty
+  'amazon',                     // Amazon.com
+  'virgin',                     // Virgin brands
+  'shell',                      // Shell gas station
+  'nest',                       // Google Nest
+  'target',                     // Target stores
+  'eclipse',                    // Eclipse gum, Eclipse IDE
+  'horizon',                    // Horizon organic
+]);
+
 function isBareCommodityName(text: string): BareCommodityResult {
   // Normalize: lowercase, trim, collapse whitespace
   const normalized = text.toLowerCase().trim().replace(/\s+/g, ' ');
 
   // Reject if empty
   if (!normalized) {
+    return { match: false };
+  }
+
+  // Skip commodity fast-path for ambiguous terms that could be brands
+  if (AMBIGUOUS_COMMODITY_TERMS.has(normalized)) {
     return { match: false };
   }
 
@@ -352,6 +394,9 @@ function isBareCommodityName(text: string): BareCommodityResult {
  * Returns a complete BunkdAnalysisResult with bunk_score = 0.0
  */
 function buildBareCommodityResult(item: string): BunkdAnalysisResult {
+  // Get verdict fields for score 0
+  const verdictFields = getVerdictFields(0);
+
   return {
     version: "bunkd_v1",
     scoring_version: "2.0",
@@ -360,11 +405,20 @@ function buildBareCommodityResult(item: string): BunkdAnalysisResult {
     confidence_level: "high",
     confidence_explanation: "Item-only query; no seller, claims, or pricing provided, so BS risk is effectively zero.",
     verdict: "low",
+    verdict_label: verdictFields.verdict_label,
+    secondary_verdict: verdictFields.secondary_verdict,
+    verdict_text: verdictFields.verdict_text,
+    meter_label: verdictFields.meter_label,
     unable_to_score: false,
     summary: `"${item}" is a basic whole food or commodity. Without seller information, pricing, or specific claims to evaluate, there's no BS to detect.`,
     evidence_bullets: [],
     key_claims: [],
     red_flags: [],
+    risk_signals: [],
+    claims_summary: {
+      claims: [],
+      status: 'No claims to analyze',
+    },
     subscores: {
       human_evidence: 10,
       authenticity_transparency: 10,
@@ -581,10 +635,19 @@ function buildDisambiguationResult(
     confidence: 0.3, // Low confidence since we don't know what they mean
     confidence_level: "low",
     confidence_explanation: "Query is ambiguous - please select the intended meaning.",
+    verdict_label: "Needs Clarification",
+    secondary_verdict: "Select the intended meaning",
+    verdict_text: "Please select what you meant to analyze.",
+    meter_label: "Pending",
     summary: `The query "${query}" could refer to multiple things. Please select the intended meaning to get an accurate BS score.`,
     evidence_bullets: [],
     key_claims: [],
     red_flags: [],
+    risk_signals: [],
+    claims_summary: {
+      claims: [],
+      status: 'Awaiting clarification',
+    },
     subscores: {
       human_evidence: 0,
       authenticity_transparency: 0,
@@ -2214,13 +2277,78 @@ function extractStructuredData(
   const bunkScore = scoreResult.finalScore10;
   const verdict = getVerdictFromScore(bunkScore);
 
+  // Get aligned verdict fields from verdict-mapping
+  const verdictFields = getVerdictFields(bunkScore);
+
+  // Sanitize summary for score alignment
+  const sanitizedSummary = sanitizeSummary(summary, bunkScore);
+
+  // ========================================================================
+  // PHASE 2: CONTENT SANITIZATION FOR TONE CONSISTENCY
+  // ========================================================================
+  // Apply content sanitization to all text fields based on score
+  console.log('  📝 Applying content sanitization...');
+
+  // Sanitize summary content (in addition to verdict alignment)
+  const fullySanitizedSummary = sanitizeContentText(sanitizedSummary, bunkScore);
+
+  // Sanitize evidence bullets
+  const sanitizedEvidence = finalEvidence.map(bullet =>
+    sanitizeContentText(bullet, bunkScore)
+  );
+
+  // Sanitize red flags and deduplicate
+  const sanitizedRedFlags = finalRedFlags.map(flag =>
+    sanitizeContentText(flag, bunkScore)
+  );
+  // Phase 3: Cap at 4 red flags max after deduplication
+  const dedupedRedFlags = deduplicateRedFlags(sanitizedRedFlags).slice(0, 4);
+
+  // Sanitize key claims (both claim text and why field)
+  const sanitizedClaims = finalClaims.map(claim => ({
+    ...claim,
+    claim: sanitizeContentText(claim.claim, bunkScore),
+    why: sanitizeContentText(claim.why, bunkScore),
+  }));
+
+  // ========================================================================
+  // PHASE 3: UX POLISH - Generate risk_signals and claims_summary
+  // ========================================================================
+
+  // Convert red flags to risk_signals with severity (based on score band)
+  const baseSeverity = bunkScore >= 8 ? 4 : bunkScore >= 6.5 ? 3 : bunkScore >= 4 ? 2 : 1;
+  const riskSignals = dedupedRedFlags.map((text, index) => ({
+    text,
+    // First flag gets base severity, subsequent flags get decreasing severity (min 1)
+    severity: Math.max(1, baseSeverity - Math.floor(index / 2)),
+  }));
+
+  // Generate claims_summary from sanitized claims
+  const supportedCount = sanitizedClaims.filter(c => c.support_level === 'supported').length;
+  const mixedCount = sanitizedClaims.filter(c => c.support_level === 'mixed').length;
+  const weakCount = sanitizedClaims.filter(c => c.support_level === 'weak').length;
+  const unsupportedCount = sanitizedClaims.filter(c => c.support_level === 'unsupported').length;
+
+  const statusParts: string[] = [];
+  if (supportedCount > 0) statusParts.push(`${supportedCount} supported`);
+  if (mixedCount > 0) statusParts.push(`${mixedCount} mixed`);
+  if (weakCount > 0) statusParts.push(`${weakCount} weak`);
+  if (unsupportedCount > 0) statusParts.push(`${unsupportedCount} unsupported`);
+
+  const claimsSummary = {
+    claims: sanitizedClaims.slice(0, 3).map(c => c.claim),
+    status: statusParts.length > 0 ? statusParts.join(', ') : 'No claims analyzed',
+  };
+
   const result: BunkdAnalysisResult = {
     version: 'bunkd_v1',
     scoring_version: '2.0',
-    summary,
-    evidence_bullets: finalEvidence,
-    key_claims: finalClaims as any,
-    red_flags: finalRedFlags,
+    summary: fullySanitizedSummary,
+    evidence_bullets: sanitizedEvidence,
+    key_claims: sanitizedClaims as any,
+    red_flags: dedupedRedFlags,
+    risk_signals: riskSignals,
+    claims_summary: claimsSummary,
     subscores: legacySubscores,
     // New fields for v2.0
     category: primaryCategory.id,
@@ -2241,6 +2369,10 @@ function extractStructuredData(
     // ALWAYS set score and verdict
     bunk_score: bunkScore,
     verdict: verdict,
+    verdict_label: verdictFields.verdict_label,
+    secondary_verdict: verdictFields.secondary_verdict,
+    verdict_text: verdictFields.verdict_text,
+    meter_label: verdictFields.meter_label,
     // Confidence fields
     confidence: categoryConfidence,
     confidence_level: confidenceLevel,
@@ -2601,6 +2733,9 @@ function parseAndValidateResponse(rawContent: string, pageContentLength?: number
     const computedScore = computeBunkScore(parseResult.result.subscores);
     const computedVerdict = verdictFromScore(computedScore);
 
+    // Get aligned verdict fields from verdict-mapping
+    const verdictFields = getVerdictFields(computedScore);
+
     // Compute confidence level and explanation
     const confidenceLevel = toConfidenceLevel(confidence);
     const confExplanation = confidenceExplanation(confidenceLevel);
@@ -2613,6 +2748,64 @@ function parseAndValidateResponse(rawContent: string, pageContentLength?: number
       disclaimers = [...disclaimers, 'Score based on partial evidence - treat as preliminary assessment'];
     }
 
+    // Sanitize summary for score alignment
+    const sanitizedSummary = sanitizeSummary(parseResult.result.summary, computedScore);
+
+    // ========================================================================
+    // PHASE 2: CONTENT SANITIZATION FOR TONE CONSISTENCY (FALLBACK PATH)
+    // ========================================================================
+    console.log('  📝 Applying content sanitization (fallback path)...');
+
+    // Sanitize summary content
+    const fullySanitizedSummary = sanitizeContentText(sanitizedSummary, computedScore);
+
+    // Sanitize evidence bullets
+    const sanitizedEvidence = parseResult.result.evidence_bullets.map((bullet: string) =>
+      sanitizeContentText(bullet, computedScore)
+    );
+
+    // Sanitize red flags and deduplicate
+    const sanitizedRedFlags = redFlags.map((flag: string) =>
+      sanitizeContentText(flag, computedScore)
+    );
+    // Phase 3: Cap at 4 red flags max after deduplication
+    const dedupedRedFlags = deduplicateRedFlags(sanitizedRedFlags).slice(0, 4);
+
+    // Sanitize key claims
+    const sanitizedClaims = parseResult.result.key_claims.map((claim: any) => ({
+      ...claim,
+      claim: sanitizeContentText(claim.claim, computedScore),
+      why: sanitizeContentText(claim.why, computedScore),
+    }));
+
+    // ========================================================================
+    // PHASE 3: UX POLISH - Generate risk_signals and claims_summary (FALLBACK)
+    // ========================================================================
+
+    // Convert red flags to risk_signals with severity
+    const baseSeverity = computedScore >= 8 ? 4 : computedScore >= 6.5 ? 3 : computedScore >= 4 ? 2 : 1;
+    const riskSignals = dedupedRedFlags.map((text: string, index: number) => ({
+      text,
+      severity: Math.max(1, baseSeverity - Math.floor(index / 2)),
+    }));
+
+    // Generate claims_summary
+    const supportedCount = sanitizedClaims.filter((c: any) => c.support_level === 'supported').length;
+    const mixedCount = sanitizedClaims.filter((c: any) => c.support_level === 'mixed').length;
+    const weakCount = sanitizedClaims.filter((c: any) => c.support_level === 'weak').length;
+    const unsupportedCount = sanitizedClaims.filter((c: any) => c.support_level === 'unsupported').length;
+
+    const statusParts: string[] = [];
+    if (supportedCount > 0) statusParts.push(`${supportedCount} supported`);
+    if (mixedCount > 0) statusParts.push(`${mixedCount} mixed`);
+    if (weakCount > 0) statusParts.push(`${weakCount} weak`);
+    if (unsupportedCount > 0) statusParts.push(`${unsupportedCount} unsupported`);
+
+    const claimsSummary = {
+      claims: sanitizedClaims.slice(0, 3).map((c: any) => c.claim),
+      status: statusParts.length > 0 ? statusParts.join(', ') : 'No claims analyzed',
+    };
+
     const finalResult: BunkdAnalysisResult = {
       version: 'bunkd_v1',
       bunk_score: computedScore,
@@ -2620,13 +2813,19 @@ function parseAndValidateResponse(rawContent: string, pageContentLength?: number
       confidence_level: confidenceLevel,
       confidence_explanation: confExplanation,
       verdict: computedVerdict,
+      verdict_label: verdictFields.verdict_label,
+      secondary_verdict: verdictFields.secondary_verdict,
+      verdict_text: verdictFields.verdict_text,
+      meter_label: verdictFields.meter_label,
       // DEPRECATED: kept for backward compat, always false now
       unable_to_score: false,
-      summary: parseResult.result.summary,
-      evidence_bullets: parseResult.result.evidence_bullets,
+      summary: fullySanitizedSummary,
+      evidence_bullets: sanitizedEvidence,
       subscores: parseResult.result.subscores,
-      key_claims: parseResult.result.key_claims,
-      red_flags: redFlags,
+      key_claims: sanitizedClaims,
+      red_flags: dedupedRedFlags,
+      risk_signals: riskSignals,
+      claims_summary: claimsSummary,
       citations: parseResult.result.citations,
       product_details: parseResult.result.product_details,
       disclaimers: disclaimers.length > 0 ? disclaimers : undefined,
@@ -2957,8 +3156,12 @@ async function processJob(job: Job): Promise<void> {
 
         console.log(`  ⚡ ARCHETYPE BOOST APPLIED: "${archetype.name}" raised score from ${originalScore} to ${result.bunk_score}`);
 
-        // Update verdict based on new score
-        result.verdict = result.bunk_score >= 6.5 ? 'high' : result.bunk_score > 3.5 ? 'elevated' : 'low';
+        // Update verdict fields based on new score
+        const boostedVerdictFields = getVerdictFields(result.bunk_score);
+        result.verdict = boostedVerdictFields.verdict;
+        result.verdict_label = boostedVerdictFields.verdict_label;
+        result.verdict_text = boostedVerdictFields.verdict_text;
+        result.meter_label = boostedVerdictFields.meter_label;
 
         // Add archetype info to result
         result.analysis_mode = 'claim_archetype';

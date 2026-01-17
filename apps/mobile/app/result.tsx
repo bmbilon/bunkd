@@ -35,6 +35,16 @@ const SUBSCORE_ROWS: SubscoreRowData[] = [
   { key: 'pricing_value', label: 'Pricing/Value', weight: 0.1, weightLabel: '10%' },
 ];
 
+// Helper to strip markdown formatting from AI-generated text
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')  // **bold** → bold
+    .replace(/\*([^*]+)\*/g, '$1')       // *italic* → italic
+    .replace(/`([^`]+)`/g, '$1')         // `code` → code
+    .replace(/^\s*[-•]\s*/gm, '')        // Remove bullet prefixes
+    .trim();
+}
+
 export default function ResultScreen() {
   const router = useRouter();
   const params = useLocalSearchParams();
@@ -171,6 +181,46 @@ export default function ResultScreen() {
   const getInsufficientDataReason = (): string | null => {
     const data = (result as any).result_json || result;
     return data.insufficient_data_reason || null;
+  };
+
+  // Verdict fallback functions - derive from score if server doesn't provide
+  const getVerdictLabel = (): string => {
+    const d = (result as any).result_json || result;
+    if (d.verdict_label) return d.verdict_label;
+    if (score === null) return 'Unable to Score';
+    // Fallback based on score bands matching verdict-mapping.ts
+    if (score <= 1.5) return 'Very Low Risk';
+    if (score <= 3.3) return 'Low Risk';
+    if (score <= 5.0) return 'Moderate Risk';
+    if (score <= 6.6) return 'Elevated Risk';
+    if (score <= 8.0) return 'High Risk';
+    return 'Very High Risk';
+  };
+
+  const getVerdictText = (): string => {
+    const d = (result as any).result_json || result;
+    if (d.verdict_text) return d.verdict_text;
+    if (score === null) return 'Not enough data to assess claims.';
+    // Fallback based on score bands matching verdict-mapping.ts
+    if (score <= 1.5) return 'Claims appear well-supported with strong evidence.';
+    if (score <= 3.3) return 'Claims have decent evidence support with minor gaps.';
+    if (score <= 5.0) return 'Some claims lack strong evidence. Verify before trusting.';
+    if (score <= 6.6) return 'Multiple claims have weak or missing evidence support.';
+    if (score <= 8.0) return 'Claims have minimal supporting evidence. Exercise caution.';
+    return 'Claims have almost no supporting evidence. Major red flags detected.';
+  };
+
+  const getMeterLabel = (): string => {
+    const d = (result as any).result_json || result;
+    if (d.meter_label) return d.meter_label;
+    if (score === null) return 'N/A';
+    // Fallback based on score bands matching verdict-mapping.ts
+    if (score <= 1.5) return 'Very Low BS';
+    if (score <= 3.3) return 'Low BS';
+    if (score <= 5.0) return 'Moderate BS';
+    if (score <= 6.6) return 'Elevated BS';
+    if (score <= 8.0) return 'High BS';
+    return 'Very High BS';
   };
 
   const insufficientDataReason = getInsufficientDataReason();
@@ -415,27 +465,32 @@ export default function ResultScreen() {
         {hasEvidence && (
           <View style={styles.evidenceSection}>
             <Text style={styles.evidenceSectionTitle}>Evidence Points</Text>
-            {evidenceBullets.map((bullet: string, index: number) => (
-              <View key={index} style={styles.bulletItem}>
-                <Text style={styles.bulletDot}>•</Text>
-                <Text style={styles.bulletText}>{bullet}</Text>
-              </View>
-            ))}
+            {evidenceBullets.map((bullet: string, index: number) => {
+              const cleaned = stripMarkdown(bullet);
+              const truncated = cleaned.length > 150 ? cleaned.slice(0, 150) + '...' : cleaned;
+              return (
+                <View key={index} style={styles.bulletItem}>
+                  <Text style={styles.bulletDot}>•</Text>
+                  <Text style={styles.bulletText}>{truncated}</Text>
+                </View>
+              );
+            })}
           </View>
         )}
 
         {hasFlags && (
           <View style={styles.evidenceSection}>
             <Text style={styles.evidenceSectionTitle}>Red Flags</Text>
-            {redFlags.map((flag: string, index: number) => (
+            {redFlags.slice(0, 4).map((flag: string, index: number) => (
               <View key={index} style={styles.bulletItem}>
                 <Text style={styles.bulletDot}>🚩</Text>
-                <Text style={styles.bulletText}>{flag}</Text>
+                <Text style={styles.bulletText}>{stripMarkdown(flag)}</Text>
               </View>
             ))}
           </View>
         )}
 
+        {/* Key Claims section hidden - adding negative value for now
         {hasClaims && (
           <View style={styles.evidenceSection}>
             <Text style={styles.evidenceSectionTitle}>Key Claims</Text>
@@ -443,11 +498,11 @@ export default function ResultScreen() {
               .sort((a: any, b: any) => {
                 const rankA = getSupportRank(a.support_level || '');
                 const rankB = getSupportRank(b.support_level || '');
-                return rankA - rankB; // Ascending: most problematic (red/orange) to strongest (green)
+                return rankA - rankB;
               })
               .map((claim: any, index: number) => (
                 <View key={index} style={styles.claimCard}>
-                  <Text style={styles.claimText}>{claim.claim}</Text>
+                  <Text style={styles.claimText}>{stripMarkdown(claim.claim)}</Text>
                   {claim.support_level && (
                     <View style={styles.claimMeta}>
                       <View style={[
@@ -459,12 +514,13 @@ export default function ResultScreen() {
                     </View>
                   )}
                   {claim.why && (
-                    <Text style={styles.claimWhy}>{claim.why}</Text>
+                    <Text style={styles.claimWhy}>{stripMarkdown(claim.why)}</Text>
                   )}
                 </View>
               ))}
           </View>
         )}
+        */}
       </View>
     );
   };
@@ -546,8 +602,8 @@ export default function ResultScreen() {
 
         {/* Big Score Card */}
         <View style={[styles.scoreCard, { borderColor: scoreColor }]}>
-          <Text style={styles.primaryLabel}>BS Meter</Text>
-          <Text style={styles.secondaryLabel}>Bunkd Score</Text>
+          <Text style={styles.primaryLabel}>{getMeterLabel()}</Text>
+          <Text style={styles.secondaryLabel}>BS Meter</Text>
 
           {unableToScore ? (
             <View style={styles.unableToScoreContainer}>
@@ -567,7 +623,7 @@ export default function ResultScreen() {
                   /10
                 </Text>
               </View>
-              <Text style={[styles.scoreTier, { color: scoreColor }]}>{scoreTier}</Text>
+              <Text style={[styles.scoreTier, { color: scoreColor }]}>{getVerdictLabel()}</Text>
               {interpretedAs && (
                 <Text style={styles.interpretedAs}>Interpreted as: {interpretedAs}</Text>
               )}
@@ -577,7 +633,7 @@ export default function ResultScreen() {
 
         {/* Summary */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Summary</Text>
+          <Text style={styles.sectionTitle}>{getVerdictLabel()}</Text>
 
           {unableToScore && insufficientDataReason && (
             <View style={styles.insufficientDataBanner}>
@@ -586,7 +642,11 @@ export default function ResultScreen() {
             </View>
           )}
 
-          <Text style={styles.summaryText}>{result.summary}</Text>
+          <Text style={styles.verdictText}>{getVerdictText()}</Text>
+
+          <Text style={styles.summarySectionLabel}>Summary</Text>
+
+          <Text style={styles.summaryText}>{stripMarkdown(result.summary)}</Text>
         </View>
 
         {/* Tabbed Section */}
@@ -746,6 +806,19 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 24,
     color: '#d1d5db', // Body text (gray-300)
+  },
+  verdictText: {
+    fontSize: 16,
+    lineHeight: 24,
+    color: '#9ca3af', // Gray-400
+    marginBottom: 16,
+    fontStyle: 'italic',
+  },
+  summarySectionLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#9ca3af', // Gray-400
+    marginBottom: 8,
   },
   // Tab Bar Styles
   tabBar: {
