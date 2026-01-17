@@ -139,6 +139,21 @@ const DISQUALIFYING_TOKENS = new Set([
   'brand', 'tm', '®', '™', 'inc', 'llc', 'co', 'corp',
 ]);
 
+// Commodity terms that are also commonly brand names - skip Tier 1, force disambiguation
+const AMBIGUOUS_COMMODITY_TERMS = new Set([
+  'apple', 'apples',           // Apple Inc
+  'blackberry', 'blackberries', // BlackBerry phones
+  'orange', 'oranges',          // Orange telecom
+  'dove',                       // Dove soap/beauty
+  'amazon',                     // Amazon.com
+  'virgin',                     // Virgin brands (also olive oil descriptor)
+  'shell',                      // Shell gas station
+  'nest',                       // Google Nest
+  'target',                     // Target stores
+  'eclipse',                    // Eclipse gum, Eclipse IDE
+  'horizon',                    // Horizon organic (but also generic milk brand)
+]);
+
 // =============================================================================
 // THE 12 SCAM ARCHETYPES
 // =============================================================================
@@ -511,12 +526,18 @@ export const ARCHETYPE_DEFINITIONS: ClaimArchetype[] = [
 
 /**
  * Check if text is a commodity (Tier 1)
+ * Returns false for ambiguous terms that could be brands (apple, blackberry, etc.)
  */
 export function isCommodity(text: string): { match: boolean; item?: string } {
   const normalized = text.toLowerCase().trim().replace(/\s+/g, ' ');
 
   // Reject if empty or too long
   if (!normalized || normalized.split(' ').length > 5) {
+    return { match: false };
+  }
+
+  // Skip Tier 1 for ambiguous terms that could be brands - force disambiguation
+  if (AMBIGUOUS_COMMODITY_TERMS.has(normalized)) {
     return { match: false };
   }
 

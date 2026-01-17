@@ -75,11 +75,10 @@ Deno.serve(async (req) => {
 
   console.log(`[${requestId}] ========== ANALYZE_PRODUCT INGRESS ==========`);
 
-  // TODO: Re-enable user_id extraction once schema cache is updated
   // Extract user_id from JWT token (for history feature)
-  // const authHeader = req.headers.get('Authorization');
-  // const userId = extractUserIdFromJWT(authHeader);
-  // console.log(`[${requestId}] User ID: ${userId || '(anonymous)'}`);
+  const authHeader = req.headers.get('Authorization');
+  const userId = extractUserIdFromJWT(authHeader);
+  console.log(`[${requestId}] User ID: ${userId || '(anonymous)'}`);
 
   try {
     // Parse input
@@ -105,6 +104,12 @@ Deno.serve(async (req) => {
     // Disambiguation fields - when user selects from picker
     const selectedCandidateId = body.selected_candidate_id;
     const interpretedAs = body.interpreted_as;
+
+    console.log(`[${requestId}] Disambiguation fields:`, {
+      selected_candidate_id: selectedCandidateId || '(none)',
+      interpreted_as: interpretedAs || '(none)',
+      body_keys: Object.keys(body),
+    });
 
     // Determine input type and value
     let inputType: string;
@@ -140,12 +145,15 @@ Deno.serve(async (req) => {
     let cacheKeyInput = normalizedInput;
     if (selectedCandidateId) {
       cacheKeyInput = `${normalizedInput}:resolved:${selectedCandidateId}`;
+      console.log(`[${requestId}] Cache key includes disambiguation: ${cacheKeyInput}`);
+    } else {
+      console.log(`[${requestId}] Cache key (no disambiguation): ${cacheKeyInput}`);
     }
     let cacheKey = await computeCacheKey(inputType, cacheKeyInput);
     if (forceRefresh) {
       cacheKey = `${cacheKey}_${Date.now()}`;
     }
-    console.log(`[${requestId}] Cache key: ${cacheKey.substring(0, 16)}...${forceRefresh ? ' (force refresh)' : ''}${selectedCandidateId ? ` (disambiguation: ${selectedCandidateId})` : ''}`);
+    console.log(`[${requestId}] Final cache key: ${cacheKey.substring(0, 16)}...${forceRefresh ? ' (force refresh)' : ''}`);
 
     // Create Supabase client with service role (no JWT required)
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -206,11 +214,10 @@ Deno.serve(async (req) => {
       request_id: requestId,
     };
 
-    // TODO: Re-enable user_id once schema cache is updated
     // Add user_id if available (enables history feature)
-    // if (userId) {
-    //   jobData.user_id = userId;
-    // }
+    if (userId) {
+      jobData.user_id = userId;
+    }
 
     // Add disambiguation fields if provided
     if (selectedCandidateId) {

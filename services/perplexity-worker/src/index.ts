@@ -33,6 +33,7 @@ import {
   sanitizeSummary,
   sanitizeContentText,
   deduplicateRedFlags,
+  stripMarkdown,
 } from './verdict-mapping';
 
 // Load environment variables from multiple locations (later sources don't override)
@@ -2287,28 +2288,28 @@ function extractStructuredData(
   // PHASE 2: CONTENT SANITIZATION FOR TONE CONSISTENCY
   // ========================================================================
   // Apply content sanitization to all text fields based on score
-  console.log('  📝 Applying content sanitization...');
+  console.log('  📝 Applying content sanitization and markdown stripping...');
 
-  // Sanitize summary content (in addition to verdict alignment)
-  const fullySanitizedSummary = sanitizeContentText(sanitizedSummary, bunkScore);
+  // Sanitize summary content (in addition to verdict alignment) + strip markdown
+  const fullySanitizedSummary = stripMarkdown(sanitizeContentText(sanitizedSummary, bunkScore));
 
-  // Sanitize evidence bullets
+  // Sanitize evidence bullets + strip markdown
   const sanitizedEvidence = finalEvidence.map(bullet =>
-    sanitizeContentText(bullet, bunkScore)
+    stripMarkdown(sanitizeContentText(bullet, bunkScore))
   );
 
-  // Sanitize red flags and deduplicate
+  // Sanitize red flags, strip markdown, and deduplicate
   const sanitizedRedFlags = finalRedFlags.map(flag =>
-    sanitizeContentText(flag, bunkScore)
+    stripMarkdown(sanitizeContentText(flag, bunkScore))
   );
   // Phase 3: Cap at 4 red flags max after deduplication
   const dedupedRedFlags = deduplicateRedFlags(sanitizedRedFlags).slice(0, 4);
 
-  // Sanitize key claims (both claim text and why field)
+  // Sanitize key claims (both claim text and why field) + strip markdown
   const sanitizedClaims = finalClaims.map(claim => ({
     ...claim,
-    claim: sanitizeContentText(claim.claim, bunkScore),
-    why: sanitizeContentText(claim.why, bunkScore),
+    claim: stripMarkdown(sanitizeContentText(claim.claim, bunkScore)),
+    why: stripMarkdown(sanitizeContentText(claim.why, bunkScore)),
   }));
 
   // ========================================================================
@@ -2318,7 +2319,7 @@ function extractStructuredData(
   // Convert red flags to risk_signals with severity (based on score band)
   const baseSeverity = bunkScore >= 8 ? 4 : bunkScore >= 6.5 ? 3 : bunkScore >= 4 ? 2 : 1;
   const riskSignals = dedupedRedFlags.map((text, index) => ({
-    text,
+    text,  // Already stripped above
     // First flag gets base severity, subsequent flags get decreasing severity (min 1)
     severity: Math.max(1, baseSeverity - Math.floor(index / 2)),
   }));
@@ -2336,7 +2337,7 @@ function extractStructuredData(
   if (unsupportedCount > 0) statusParts.push(`${unsupportedCount} unsupported`);
 
   const claimsSummary = {
-    claims: sanitizedClaims.slice(0, 3).map(c => c.claim),
+    claims: sanitizedClaims.slice(0, 3).map(c => c.claim),  // Already stripped above
     status: statusParts.length > 0 ? statusParts.join(', ') : 'No claims analyzed',
   };
 
@@ -2754,28 +2755,28 @@ function parseAndValidateResponse(rawContent: string, pageContentLength?: number
     // ========================================================================
     // PHASE 2: CONTENT SANITIZATION FOR TONE CONSISTENCY (FALLBACK PATH)
     // ========================================================================
-    console.log('  📝 Applying content sanitization (fallback path)...');
+    console.log('  📝 Applying content sanitization and markdown stripping (fallback path)...');
 
-    // Sanitize summary content
-    const fullySanitizedSummary = sanitizeContentText(sanitizedSummary, computedScore);
+    // Sanitize summary content + strip markdown
+    const fullySanitizedSummary = stripMarkdown(sanitizeContentText(sanitizedSummary, computedScore));
 
-    // Sanitize evidence bullets
+    // Sanitize evidence bullets + strip markdown
     const sanitizedEvidence = parseResult.result.evidence_bullets.map((bullet: string) =>
-      sanitizeContentText(bullet, computedScore)
+      stripMarkdown(sanitizeContentText(bullet, computedScore))
     );
 
-    // Sanitize red flags and deduplicate
+    // Sanitize red flags, strip markdown, and deduplicate
     const sanitizedRedFlags = redFlags.map((flag: string) =>
-      sanitizeContentText(flag, computedScore)
+      stripMarkdown(sanitizeContentText(flag, computedScore))
     );
     // Phase 3: Cap at 4 red flags max after deduplication
     const dedupedRedFlags = deduplicateRedFlags(sanitizedRedFlags).slice(0, 4);
 
-    // Sanitize key claims
+    // Sanitize key claims + strip markdown
     const sanitizedClaims = parseResult.result.key_claims.map((claim: any) => ({
       ...claim,
-      claim: sanitizeContentText(claim.claim, computedScore),
-      why: sanitizeContentText(claim.why, computedScore),
+      claim: stripMarkdown(sanitizeContentText(claim.claim, computedScore)),
+      why: stripMarkdown(sanitizeContentText(claim.why, computedScore)),
     }));
 
     // ========================================================================
@@ -3175,12 +3176,59 @@ async function processJob(job: Job): Promise<void> {
         const archetypeRedFlags = archetype.redFlagsTemplate.filter(
           flag => !result.red_flags.some(existing => existing.toLowerCase().includes(flag.toLowerCase().substring(0, 20)))
         );
-        result.red_flags = [...result.red_flags, ...archetypeRedFlags].slice(0, 8);
+        const mergedRedFlags = [...result.red_flags, ...archetypeRedFlags];
 
-        // Update summary to mention archetype
-        if (!result.summary.includes(archetype.name)) {
-          result.summary = `[${archetype.name} pattern detected] ${result.summary}`;
+        // ================================================================
+        // RE-APPLY ALL SANITIZATION FOR BOOSTED SCORE
+        // All derived fields must be regenerated when score changes
+        // ================================================================
+        console.log(`  📝 Re-applying sanitization for boosted score ${result.bunk_score}...`);
+
+        // 1. Re-sanitize summary for the NEW boosted score (don't add internal prefix)
+        result.summary = sanitizeContentText(result.summary, result.bunk_score);
+        result.summary = stripMarkdown(result.summary);
+
+        // 2. Clean up, strip markdown, deduplicate, and cap red flags at 4
+        result.red_flags = mergedRedFlags
+          .map(flag => stripMarkdown(flag
+            .replace(/^and\s+/i, '')        // Remove "and " prefix
+            .replace(/^\s*-\s*/, '')        // Remove "- " prefix
+            .replace(/^\s*•\s*/, '')        // Remove "• " prefix
+            .trim()
+          ))
+          .filter(flag => flag.length > 0);
+        result.red_flags = deduplicateRedFlags(result.red_flags).slice(0, 4);
+
+        // 3. Regenerate risk_signals with correct severity for boosted score
+        const boostedSeverity = result.bunk_score >= 8 ? 4 : result.bunk_score >= 6.5 ? 3 : 2;
+        result.risk_signals = result.red_flags.map((flag, index) => ({
+          text: stripMarkdown(flag),
+          severity: Math.max(1, boostedSeverity - Math.floor(index / 2)),
+        }));
+
+        // 4. Update secondary_verdict from the band for the boosted score
+        result.secondary_verdict = boostedVerdictFields.secondary_verdict;
+
+        // 5. Regenerate claims_summary for boosted score
+        if (result.key_claims && result.key_claims.length > 0) {
+          const supportedCount = result.key_claims.filter(c => c.support_level === 'supported').length;
+          const mixedCount = result.key_claims.filter(c => c.support_level === 'mixed').length;
+          const weakCount = result.key_claims.filter(c => c.support_level === 'weak').length;
+          const unsupportedCount = result.key_claims.filter(c => c.support_level === 'unsupported').length;
+
+          const statusParts: string[] = [];
+          if (supportedCount > 0) statusParts.push(`${supportedCount} supported`);
+          if (mixedCount > 0) statusParts.push(`${mixedCount} mixed`);
+          if (weakCount > 0) statusParts.push(`${weakCount} weak`);
+          if (unsupportedCount > 0) statusParts.push(`${unsupportedCount} unsupported`);
+
+          result.claims_summary = {
+            claims: result.key_claims.slice(0, 3).map(c => stripMarkdown(c.claim)),
+            status: statusParts.length > 0 ? statusParts.join(', ') : 'Claims require verification',
+          };
         }
+
+        console.log(`  ✓ Sanitization complete: ${result.red_flags.length} red flags, ${result.risk_signals?.length || 0} risk signals`);
       } else {
         console.log(`  ℹ️ Archetype detected but score already adequate (${currentScore} >= ${archetypeMinScore})`);
       }

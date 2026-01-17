@@ -382,6 +382,19 @@ export function sanitizeContentText(text: string, score: number): string {
   return sanitized;
 }
 
+/**
+ * Strip markdown formatting from text.
+ * Removes bold, italic, code, and bullet prefixes.
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')  // **bold** → bold
+    .replace(/\*([^*]+)\*/g, '$1')       // *italic* → italic
+    .replace(/`([^`]+)`/g, '$1')         // `code` → code
+    .replace(/^\s*[-•]\s*/gm, '')        // Remove bullet prefixes
+    .trim();
+}
+
 // ============================================================================
 // RED FLAG DEDUPLICATION
 // ============================================================================

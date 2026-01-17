@@ -28,40 +28,78 @@ export default function HistoryScreen() {
   const [refreshing, setRefreshing] = useState(false);
 
   const loadHistory = async () => {
+    console.log('[History] ========== LOADING HISTORY ==========');
     try {
       // Get the current user's ID from the session
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+
+      console.log('[History] Session check:', {
+        hasSession: !!session,
+        sessionError: sessionError?.message,
+        userId: session?.user?.id,
+        userEmail: session?.user?.email,
+        isAnonymous: session?.user?.is_anonymous,
+        expiresAt: session?.expires_at,
+      });
+
       const userId = session?.user?.id;
 
       if (!userId) {
-        console.log('[History] No authenticated user found');
+        console.log('[History] No authenticated user found - session is null or no user');
         setHistory([]);
         return;
       }
 
-      console.log('[History] Loading history for user:', userId);
+      console.log('[History] Querying with userId:', userId);
+      console.log('[History] userId type:', typeof userId);
+      console.log('[History] userId length:', userId.length);
 
       // Fetch user's analysis jobs directly
       const { data, error } = await supabase
         .from('analysis_jobs')
-        .select('id, input_type, input_value, created_at, status, bs_score, result_json')
+        .select('id, input_type, input_value, created_at, status, bs_score, result_json, user_id')
         .eq('user_id', userId)
         .order('created_at', { ascending: false })
         .limit(50);
+
+      console.log('[History] Query response:', {
+        dataCount: data?.length ?? 0,
+        error: error?.message,
+        errorCode: error?.code,
+        errorDetails: error?.details,
+      });
+
+      // Debug: Also try a query without user_id filter to see what's in the table
+      const { data: allJobs, error: allJobsError } = await supabase
+        .from('analysis_jobs')
+        .select('id, user_id, status, created_at')
+        .order('created_at', { ascending: false })
+        .limit(5);
+
+      console.log('[History] Debug - All recent jobs (no user filter):', {
+        count: allJobs?.length ?? 0,
+        error: allJobsError?.message,
+        jobs: allJobs?.map(j => ({ id: j.id?.slice(0, 8), user_id: j.user_id?.slice(0, 8), status: j.status })),
+      });
 
       if (error) {
         console.error('[History] Error loading history:', error);
         setHistory([]);
       } else if (data) {
         console.log(`[History] Loaded ${data.length} items`);
+        // Log first item for debugging
+        if (data.length > 0) {
+          console.log('[History] First item:', JSON.stringify(data[0], null, 2));
+        }
         // Transform data - filter out disambiguation-only results
         const items: HistoryItem[] = data
           .filter((item: any) => {
             // Exclude disambiguation results that don't have a real score
-            if (item.result_json?.needs_disambiguation && item.bs_score === null) {
-              return false;
+            const shouldExclude = item.result_json?.needs_disambiguation && item.bs_score === null;
+            if (shouldExclude) {
+              console.log('[History] Filtering out disambiguation item:', item.id);
             }
-            return true;
+            return !shouldExclude;
           })
           .map((item: any) => ({
             id: item.id,

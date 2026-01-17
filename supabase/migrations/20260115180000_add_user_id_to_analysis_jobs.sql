@@ -1,8 +1,12 @@
--- Migration: Add user_id to analysis_jobs for History tab functionality
--- This allows users to see their analysis history
+-- Migration: Add user_id and disambiguation fields to analysis_jobs
+-- This enables: 1) History tab functionality, 2) Disambiguation flow
 
 -- Add user_id column (nullable to support anonymous users and existing records)
 ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS user_id uuid;
+
+-- Add disambiguation columns (needed for the disambiguation flow to work)
+ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS selected_candidate_id text;
+ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS interpreted_as text;
 
 -- Add index for efficient user history queries
 CREATE INDEX IF NOT EXISTS idx_analysis_jobs_user_id ON analysis_jobs(user_id)
@@ -85,3 +89,5 @@ END;
 $$ LANGUAGE plpgsql;
 
 COMMENT ON COLUMN analysis_jobs.user_id IS 'User ID from JWT token - enables history feature';
+COMMENT ON COLUMN analysis_jobs.selected_candidate_id IS 'ID of disambiguation candidate selected by user';
+COMMENT ON COLUMN analysis_jobs.interpreted_as IS 'Human-readable label of selected disambiguation';
